@@ -426,7 +426,8 @@ def build_category_deck(report: dict, qc: dict, out_path: str,
     if mtop:
         s = prs.slides.add_slide(blank)
         _title(s, f"Top {len(mtop)} manufacturers",
-               f"Rank before vs after, with movement classification ({primary})")
+               f"The largest in the previous database, followed into the updated one "
+               f"({primary})")
         rows = []
         for b in mtop:
             rows.append([

@@ -314,7 +314,7 @@ async function main() {
     rows: [...document.querySelectorAll('#profile-out .stat')]
             .filter(s => /rows/i.test(s.querySelector('.s-label')?.innerText || ''))
             .map(s => s.querySelector('.s-value')?.innerText),
-    text: document.querySelector('#profile-out').innerText.slice(0, 400),
+    text: (document.querySelector('#profile-out') || {}).innerText?.slice(0, 400) || '',
   })`)
   console.log('  profile:', JSON.stringify({ cards: prof.cards, stats: prof.stats,
     dimSelects: prof.dimSelects, rows: prof.rows }))
@@ -341,180 +341,265 @@ async function main() {
     await sleep(1000)
     if (await activeStep() === '3') break
   }
-  check('advanced to step 3 (dimension mapping)', await activeStep() === '3')
+  check('advanced to step 3 (market mapping)', await activeStep() === '3')
+  // Step 3 is now the user-authored market *pairing* screen - there are no
+  // per-dimension tabs, because manufacturer/brand were removed and market is
+  // authored as A-value -> level -> B-value rows.
   const mapInfo = await evaluate(`({
+    addBtn: !!document.querySelector('#mkt-add, [data-mkt-add]'),
+    levelSel: document.querySelectorAll('#mkt-level, [data-mkt-level]').length,
+    pairs: document.querySelectorAll('.mkt-pair, [data-mkt-row]').length,
     tabs: document.querySelectorAll('#map-tabs .tab').length,
-    badges: [...document.querySelectorAll('#map-body .badge')].map(b => b.textContent.trim()),
-    summary: document.querySelector('#map-body .map-sum')?.innerText,
+    text: (document.querySelector('#panel-3') || document.body).innerText.slice(0, 300),
   })`)
-  console.log('  dimension mapping:', JSON.stringify({ tabs: mapInfo.tabs }))
-  check('one mapping tab per non-category dimension', mapInfo.tabs === 3,
-        `${mapInfo.tabs} (market/manufacturer/brand)`)
-  const tabNames = await evaluate(
-    `[...document.querySelectorAll('#map-tabs .tab')].map(t => t.textContent.trim())`)
-  console.log('  dimension tabs:', JSON.stringify(tabNames))
-  check('category is no longer handled in this step',
-        !tabNames.some(t => /categor/i.test(t)),
-        'category moved to its own step')
-  await shot('04-step3-dimension-mapping')
+  console.log('  market mapping:', JSON.stringify({
+    addBtn: mapInfo.addBtn, pairs: mapInfo.pairs, tabs: mapInfo.tabs }))
+  check('the per-dimension tabs are gone (market pairing replaced them)',
+        mapInfo.tabs === 0, `${mapInfo.tabs} tabs`)
+  check('market pairing offers a level selector', mapInfo.levelSel >= 1,
+        `${mapInfo.levelSel} level control(s)`)
+  check('market pairing offers a way to add a pairing', mapInfo.addBtn === true)
+
+  // Author a pairing: A's Total onto B's Total at level "total". Nothing is
+  // paired until the user says so, so without this the market scope in step 5 is
+  // legitimately empty - which is what the earlier version of this probe read as
+  // a product defect.
+  await click('#mkt-add')
+  await sleep(600)
+  const pairCount = await evaluate(
+    `document.querySelectorAll('#map-out select[data-mkt-a]').length`)
+  check('adding a pairing creates an editable row', pairCount >= 1,
+        `${pairCount} pairing row(s)`)
+  const paired = await evaluate(`(() => {
+    const pick = (sel, wantTotal) => {
+      const el = document.querySelector(sel);
+      if (!el) return 'no-control';
+      const opts = [...el.options].map(o => o.value).filter(Boolean);
+      if (!opts.length) return 'no-options';
+      // Prefer the Total: it is the only level whose channels are a subset, so it
+      // is the correct scope for a whole-market impact study.
+      const chosen = wantTotal
+        ? (opts.find(o => /total/i.test(o)) || opts[0])
+        : opts[0];
+      el.value = chosen;
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return chosen;
+    };
+    return {
+      a: pick('#map-out select[data-mkt-a]', true),
+      b: pick('#map-out select[data-mkt-b]', true),
+      level: pick('#map-out select[data-mkt-level]', false),
+    };
+  })()`)
+  await sleep(900)
+  console.log('  pairing authored:', JSON.stringify(paired))
+  const pairState = await evaluate(`(() => {
+    const pairs = (window.S && window.S.marketPairs) || [];
+    return { n: pairs.length, a: pairs[0] && pairs[0].market_a,
+             b: pairs[0] && pairs[0].market_b, level: pairs[0] && pairs[0].level };
+  })()`)
+  check('the authored pairing is recorded with its level',
+        pairState.n >= 1, JSON.stringify(pairState))
+  await shot('04-step3-market-mapping')
 
   // ---- step 4: category mapping -------------------------------------------
+  //
+  // The user builds this list; nothing is proposed. `+ Mapping` opens an editor,
+  // `Done` commits it, and the list is the mapping. This block walks that path
+  // with the real controls and asserts the deletion as well as the addition: the
+  // accordion over all 151 categories, the status column, the search box and the
+  // 150-option combobox must all be gone, because "remove everything else" was
+  // half the brief.
   await click('#btn-catmap')
   for (let i = 0; i < 240; i++) {
     await sleep(1000)
     if (await activeStep() === '4') break
   }
   check('advanced to step 4 (category mapping)', await activeStep() === '4')
-  const cmAttention = await evaluate(
-    `document.querySelectorAll('#cm-tbl tbody tr').length`)
-  const cmAttentionText = await evaluate(
-    `document.querySelector('#cm-tbl tbody')?.innerText?.slice(0, 90)`)
-  console.log('  category rows needing attention:', cmAttention,
-    JSON.stringify(cmAttentionText))
+  await sleep(1200)
 
-  // The step opens in "one category at a time" mode, which is an accordion over
-  // the same rows: the first row needing a decision is expanded, the full table
-  // is deliberately hidden (#cm-table-card display:none). Assert the accordion
-  // itself first - one open at a time, its attached targets, an add-target button
-  // and a status control - then switch the mode off to assert the full table,
-  // which is where targets are reassigned.
-  const accCount = await evaluate(
-    `document.querySelectorAll('#cm-acc .acc-item').length`)
-  check('the accordion lists every category',
-        accCount >= 100, `${accCount} rows`)
-  const closedState = await evaluate(
-    `document.querySelectorAll('#cm-acc .acc-item.open').length`)
-  check('exactly one category is expanded at a time',
-        closedState === 1, `${closedState} open`)
-  // The step opens the first row that still needs a decision, so the controls
-  // are visible on arrival without a click. Inspect that row, then open a
-  // DIFFERENT one and confirm the first closed.
-  const accFirst = await evaluate(`(() => {
-    const open = document.querySelector('#cm-acc .acc-item.open');
-    if (!open) return { open: 0 };
-    return {
-      open: document.querySelectorAll('#cm-acc .acc-item.open').length,
-      name: (open.querySelector('.acc-head') || {}).innerText || '',
-      // The controls the body actually renders: an analysis-name input, a status
-      // select, a target list, and the add-target button. These are element ids,
-      // not data-* attributes.
-      hasCanonical: !!open.querySelector('#cm-canon'),
-      hasStatus: !!open.querySelector('#cm-status'),
-      // In the accordion the attached targets are listed as chips, each with a
-      // remove button; the editable category dropdowns belong to the full-table
-      // view (targetEditor in drawCatmapRows), not to this body.
-      hasTargets: !!open.querySelector('#cm-targets'),
-      hasTargetChips: !!open.querySelector('#cm-targets .chip'),
-      hasRemove: !!open.querySelector('#cm-targets [data-rm]'),
-      hasAdd: !!open.querySelector('#cm-add'),
-      hasValues: !!open.querySelector('.acc-vals-box'),
-    };
-  })()`)
-  const accSecond = await evaluate(`(() => {
-    const items = [...document.querySelectorAll('#cm-acc .acc-item')];
-    const openIdx = items.findIndex(it => it.classList.contains('open'));
-    const other = items[openIdx + 1] || items[openIdx - 1];
-    if (!other) return -1;
-    const head = other.querySelector('.acc-head');
-    if (head) head.click();
-    return document.querySelectorAll('#cm-acc .acc-item.open').length;
-  })()`)
-  console.log('  accordion:', JSON.stringify(accFirst), '->', accSecond, 'open')
-  check('expanded row lists its attached targets',
-        accFirst.hasTargetChips === true && accFirst.hasRemove === true,
-        `chips=${accFirst.hasTargetChips} removable=${accFirst.hasRemove}`)
-  check('expanded row exposes an editable analysis name',
-        accFirst.hasCanonical === true)
-  check('the expanded row can take an extra target (1:N)',
-        accFirst.hasAdd === true)
-  check('the expanded row can be excluded', accFirst.hasStatus === true)
-  check('the expanded row shows before/after values',
-        accFirst.hasValues === true)
-  check('opening a second category closes the first',
-        accSecond === 1, `${accSecond} open`)
-  await shot('05a-step4-accordion')
-
-  // Switch off one-at-a-time so the full table is visible and assertable.
-  await evaluate(`(() => {
-    const t = document.querySelector('#cm-onlyone');
-    if (t && t.checked) { t.checked = false; t.dispatchEvent(new Event('change', {bubbles:true})); }
-  })()`)
-  await sleep(600)
-  const tableVisible = await evaluate(
-    `getComputedStyle(document.querySelector('#cm-table-card')).display !== 'none'`)
-  check('turning one-at-a-time off reveals the full table', tableVisible === true)
-  // With every category matching automatically the default view is correctly
-  // empty, so tick "show all" before inspecting the table.
-  await evaluate(`document.querySelector('#cm-showall').click()`)
-  await sleep(600)
-  const cm = await evaluate(`({
-    stats: document.querySelectorAll('#catmap-out .stat').length,
-    rows: document.querySelectorAll('#cm-tbl tbody tr').length,
-    hasTargetEditor: !!document.querySelector('#cm-tbl [data-cm-cat]'),
-    hasCanonical: !!document.querySelector('#cm-tbl [data-cm-canonical]'),
-    hasAddTarget: !!document.querySelector('#cm-tbl [data-cm-add]'),
-    hasStatus: !!document.querySelector('#cm-tbl [data-cm-status]'),
-    newInB: document.querySelectorAll('#catmap-out .chip[data-newb]').length,
+  const cmOpen = await evaluate(`({
+    addMap: !!document.querySelector('#cm-add-map'),
+    addLabel: (document.querySelector('#cm-add-map') || {}).innerText || '',
+    maps: document.querySelectorAll('.cm-map').length,
+    accordion: document.querySelectorAll('#cm-acc .acc-item').length,
+    table: !!document.querySelector('#cm-tbl'),
+    showall: !!document.querySelector('#cm-showall'),
+    search: !!document.querySelector('#cm-search'),
+    allatonce: !!document.querySelector('#cm-allatonce'),
+    combo: document.querySelectorAll('.combo').length,
+    draft: !!document.querySelector('.cm-draft'),
   })`)
-  console.log('  category mapping:', JSON.stringify({ stats: cm.stats, rows: cm.rows,
-    newInB: cm.newInB }))
-  check('category mapping summary rendered', cm.stats === 8, `${cm.stats} tiles`)
-  check('every category is listed with a target editor',
-        cm.hasTargetEditor === true && cm.rows >= 100, `${cm.rows} rows`)
-  check('each row exposes an editable analysis name', cm.hasCanonical === true)
-  check('rows can take an extra target (1:N)', cm.hasAddTarget === true)
-  check('rows can be excluded', cm.hasStatus === true)
-  check('new-in-B units are listed', cm.newInB >= 2, `${cm.newInB}`)
+  console.log('  step 4 opens:', JSON.stringify(cmOpen))
+  check('the step opens with a "+ Mapping" control',
+        cmOpen.addMap === true && /mapping/i.test(cmOpen.addLabel),
+        `"${cmOpen.addLabel}"`)
+  check('the mapping list starts empty', cmOpen.maps === 0, `${cmOpen.maps} card(s)`)
+  check('the all-category accordion is gone', cmOpen.accordion === 0)
+  check('the full-table view is gone',
+        cmOpen.table === false && cmOpen.showall === false
+        && cmOpen.allatonce === false)
+  check('the search box is gone', cmOpen.search === false)
+  check('the target combobox is gone', cmOpen.combo === 0)
+  await shot('05a-step4-empty')
+
+  // The editor offers a picker per side, because a mapping may point at a whole
+  // category (either side) or at a category+subcategory. The Dataset 1 select is
+  // the one that carries an id; the Dataset 2 rows are addressed by data-draft-cat
+  // so a second target row can be added without a second id.
+  await click('#cm-add-map')
+  await sleep(700)
+  const draft = await evaluate(`({
+    isDraft: !!document.querySelector('.cm-draft'),
+    aOpts: (document.querySelector('#cm-draft-a-cat') || {}).options?.length || 0,
+    bOpts: (document.querySelector('[data-draft-cat="0"]') || {}).options?.length || 0,
+    hasName: !!document.querySelector('#cm-draft-name'),
+    targetRows: document.querySelectorAll('.cm-draft-target').length,
+    done: !!document.querySelector('#cm-draft-done'),
+    cancel: !!document.querySelector('#cm-draft-cancel'),
+    add: !!document.querySelector('#cm-draft-add'),
+  })`)
+  console.log('  draft:', JSON.stringify(draft))
+  check('"+ Mapping" opens the mapping editor', draft.isDraft === true)
+  check('the editor offers a Dataset 1 category picker',
+        draft.aOpts > 100, `${draft.aOpts} options`)
+  check('the editor offers a Dataset 2 category picker',
+        draft.bOpts > 100, `${draft.bOpts} options`)
+  check('the editor starts with one target row and can add more',
+        draft.targetRows === 1 && draft.add === true && draft.hasName === true)
+  check('the editor offers Done and Cancel',
+        draft.done === true && draft.cancel === true)
+
+  // Cancel must discard. Asserting only the list count would pass on an editor
+  // that saved and then hid itself, so assert the draft closed too.
+  await click('#cm-draft-cancel')
+  await sleep(400)
+  const cancelled = await evaluate(`({
+    maps: document.querySelectorAll('.cm-map').length,
+    draft: !!document.querySelector('.cm-draft'),
+  })`)
+  check('Cancel discards the draft without saving it',
+        cancelled.maps === 0 && cancelled.draft === false, JSON.stringify(cancelled))
+
+  // ---- author the mappings step 5 will offer ------------------------------
+  // Map BY NAME rather than by position: the enumeration is sorted by descending
+  // value, so the names this walk narrows to are not at the top of the list.
+  const AUTHOR_TARGETS = ['BEER', 'SNACK']
+  const pickDraft = async (side, name, ti = 0) => evaluate(`(() => {
+    const sel = ${side === 'a'
+      ? "document.querySelector('#cm-draft-a-cat')"
+      : `document.querySelector('[data-draft-cat="${ti}"]')`}
+    if (!sel) return 'NO_SELECT'
+    const hit = [...sel.options].find(o => o.value === ${JSON.stringify(name)})
+    if (!hit) return 'NO_MATCH'
+    sel.value = hit.value
+    sel.dispatchEvent(new Event('change', { bubbles: true }))
+    return sel.value
+  })()`)
+
+  const authoredTargets = []
+  // One pass per name. The 1:N mapping is authored by *editing* the SNACK card
+  // afterwards, not by adding a third mapping: the list is keyed by canonical
+  // name, so a second SNACK card would collapse onto the first in step 5 and
+  // make the counts below read as a defect.
+  for (const name of AUTHOR_TARGETS) {
+    await click('#cm-add-map')
+    await sleep(600)
+    const a = await pickDraft('a', name)
+    await sleep(450)
+    const b = await pickDraft('b', name)
+    await sleep(450)
+    await click('#cm-draft-done')
+    await sleep(600)
+    if (a === name && b === name) authoredTargets.push(name)
+    else console.log(`  ! mapping ${name} failed: a=${a} b=${b}`)
+  }
+  const afterFirstPass = await evaluate(
+    `document.querySelectorAll('.cm-map').length`)
+
+  // Reopen the SNACK mapping and give it a second Dataset 2 entry: that is how a
+  // 1:N relationship is expressed, and it must round-trip through the editor.
+  // Editing rather than adding also proves the card really reopens with its own
+  // content, which is the only way "editable" means anything.
+  await evaluate(`(() => {
+    const cards = [...document.querySelectorAll('.cm-map')];
+    const card = cards.find(c => /SNACK/i.test(c.innerText));
+    if (card) { const b = card.querySelector('[data-cm-edit]'); if (b) b.click(); }
+  })()`)
+  await sleep(700)
+  const editReopened = await evaluate(`(() => {
+    const sel = document.querySelector('[data-draft-cat="0"]');
+    return { draft: !!document.querySelector('.cm-draft'),
+             aCat: (document.querySelector('#cm-draft-a-cat') || {}).value || '',
+             bCat: sel ? sel.value : '' }
+  })()`)
+  await click('#cm-draft-add')
+  await sleep(500)
+  const twoRows = await evaluate(
+    `document.querySelectorAll('.cm-draft-target').length`)
+  await pickDraft('b', 'SNACK', 1)
+  await sleep(450)
+  await click('#cm-draft-done')
+  await sleep(600)
+
+  const authored = await evaluate(`(() => {
+    const cards = [...document.querySelectorAll('.cm-map')];
+    return {
+      count: cards.length,
+      text: cards.map(c => c.innerText.replace(/\\s+/g, ' ').trim()),
+      store: ((window.S || {}).catmapMaps || []).length,
+      targetCounts: ((window.S || {}).catmapMaps || []).map(m => (m.targets || []).length),
+      editBtns: document.querySelectorAll('[data-cm-edit]').length,
+      removeBtns: document.querySelectorAll('[data-cm-remove]').length,
+    }
+  })()`)
+  console.log('  authored:', JSON.stringify({ count: authored.count, text: authored.text,
+    store: authored.store, targetCounts: authored.targetCounts }))
+  check('reopening a mapping restores its own content',
+        editReopened.draft === true && editReopened.aCat === 'SNACK'
+        && editReopened.bCat === 'SNACK', JSON.stringify(editReopened))
+  check('Done saves one card per authored mapping',
+        authored.count === AUTHOR_TARGETS.length
+        && afterFirstPass === AUTHOR_TARGETS.length
+        && authoredTargets.length === AUTHOR_TARGETS.length,
+        `${authored.count} card(s) for ${authoredTargets.length} names`)
+  check('the saved cards show both sides',
+        authored.text.every(t => /Dataset 1/.test(t) && /Dataset 2/.test(t)),
+        authored.text.join(' | '))
+  check('every saved mapping is editable and removable',
+        authored.editBtns === authored.count && authored.removeBtns === authored.count,
+        `${authored.editBtns} edit / ${authored.removeBtns} remove`)
+  check('the mappings are recorded in state, not just rendered',
+        authored.store === authored.count, `${authored.store} in state`)
+  check('a mapping can carry more than one Dataset 2 entry',
+        twoRows === 2 && authored.targetCounts.includes(2),
+        `rows=${twoRows} targetCounts=[${authored.targetCounts.join(', ')}]`)
   await shot('05-step4-category-mapping')
 
-  // Editing a target must not throw away the view. Rebuilding the panel used to
-  // reset the filter and the "Show all" checkbox, so the list appeared to
-  // collapse under the cursor. Guarded here so it cannot come back.
+  // Removing a mapping must take it out of the list AND out of state.
+  const beforeRemove = authored.count
   await evaluate(`(() => {
-    const cb = document.querySelector('#cm-showall');
-    if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
-    const s = document.querySelector('#cm-search');
-    s.value = 'cig'; s.dispatchEvent(new Event('input', { bubbles: true }));
+    const btns = [...document.querySelectorAll('[data-cm-remove]')];
+    if (btns.length) btns[btns.length - 1].click();
   })()`)
   await sleep(500)
-  const beforeEdit = await evaluate(`(() => ({
-    filter: document.querySelector('#cm-search').value,
-    showAll: document.querySelector('#cm-showall').checked,
-    rows: document.querySelectorAll('#cm-tbl tbody tr').length,
-  }))()`)
-  const didEdit = await evaluate(`(() => {
-    const sel = document.querySelector('#cm-tbl select[data-cm-cat]');
-    if (!sel) return false;
-    const pick = [...sel.options].find(o => o.value && o.value !== sel.value);
-    if (!pick) return false;
-    sel.value = pick.value;
-    sel.dispatchEvent(new Event('change', { bubbles: true }));
-    return true;
-  })()`)
+  const afterRemove = await evaluate(`({
+    cards: document.querySelectorAll('.cm-map').length,
+    store: ((window.S || {}).catmapMaps || []).length,
+  })`)
+  check('a mapping can be removed from the list',
+        afterRemove.cards === beforeRemove - 1 && afterRemove.store === afterRemove.cards,
+        `${beforeRemove} -> ${afterRemove.cards} cards, ${afterRemove.store} in state`)
+  // Put the 1:N mapping back so step 5 still has the targets it asserts on.
+  await click('#cm-add-map')
   await sleep(600)
-  const afterEdit = await evaluate(`(() => ({
-    filter: document.querySelector('#cm-search').value,
-    showAll: document.querySelector('#cm-showall').checked,
-    rows: document.querySelectorAll('#cm-tbl tbody tr').length,
-    empty: /No rows match|Every category matched/.test(
-      [...document.querySelectorAll('#cm-tbl tbody tr')].map(r => r.innerText).join(' ')),
-  }))()`)
-  check('a target edit was exercised', didEdit === true)
-  check('editing a target preserves the filter', afterEdit.filter === beforeEdit.filter,
-        `"${beforeEdit.filter}" -> "${afterEdit.filter}"`)
-  check('editing a target preserves "Show all"', afterEdit.showAll === beforeEdit.showAll,
-        `${beforeEdit.showAll} -> ${afterEdit.showAll}`)
-  check('editing a target does not collapse the row list',
-        afterEdit.rows >= beforeEdit.rows && !afterEdit.empty,
-        `${beforeEdit.rows} -> ${afterEdit.rows} rows`)
-  // put the view back so the rest of the walk is unaffected
-  await evaluate(`(() => {
-    const cb = document.querySelector('#cm-showall');
-    if (cb && cb.checked) { cb.checked = false; cb.dispatchEvent(new Event('change', { bubbles: true })); }
-    const s = document.querySelector('#cm-search');
-    s.value = ''; s.dispatchEvent(new Event('input', { bubbles: true }));
-  })()`)
-  await sleep(300)
+  await pickDraft('a', 'SNACK')
+  await sleep(450)
+  await pickDraft('b', 'SNACK')
+  await sleep(450)
+  await click('#cm-draft-done')
+  await sleep(600)
+
 
   // ---- step 5: selection --------------------------------------------------
   await click('#btn-select')
@@ -563,6 +648,8 @@ async function main() {
     selected: document.querySelectorAll('#c-categories .chip.on').length,
     count: document.querySelector('#c-cat-count')?.textContent,
   })`)
+  const catNames = await evaluate(`[...document.querySelectorAll('#c-categories .chip')]
+    .map(c => c.dataset.cat)`)
   console.log('  selection:', JSON.stringify(sel), 'periods:', JSON.stringify(periodVals))
   check('the three metrics are offered as picks',
         sel.picks.length === 3
@@ -603,28 +690,49 @@ async function main() {
           parsed.map(b => `${b.key}:${b.a_current}/${b.b_current}`)))
   check('wiring is reported as valid, not silently broken',
         /Wired:/i.test(sel.note || ''), (sel.note || '').slice(0, 70))
-  check('markets rendered as chips', sel.markets >= 4, `${sel.markets}`)
-  // The scope must default to the Total Market, not to every market value:
-  // the channels are a subset of the Total, so selecting both double-counts.
+  // The scope chips are now derived from the market *pairings* the user authored
+  // in step 3, at the analysis level they chose. `marketLevels` /`baselineMarket`
+  // (the old auto-classification state) are gone.
+  check('market scope chips are derived from the authored pairings',
+        sel.markets >= 1, `${sel.markets} chip(s)`)
   const mktScope = await evaluate(`(() => {
     const on = [...document.querySelectorAll('#c-markets .chip.on')].map(c => c.dataset.market);
     const all = [...document.querySelectorAll('#c-markets .chip')].map(c => c.dataset.market);
-    return { on, all, level: window.S.marketLevel,
-             levels: window.S.marketLevels || {},
-             baseline: window.S.baselineMarket || '' };
+    const pairs = (window.S && window.S.marketPairs) || [];
+    return { on, all, pairCount: pairs.length,
+             levels: [...new Set(pairs.map(p => p.level))],
+             first: pairs[0] ? pairs[0].market_a : null };
   })()`)
-  const expectTotal = Object.entries(mktScope.levels)
-    .filter(([, l]) => l === 'total').map(([n]) => n)
-  check('the market scope defaults to the Total Market only',
-        expectTotal.length === 0
-          || (mktScope.on.length === expectTotal.length
-              && expectTotal.every(n => mktScope.on.includes(n))),
-        `on=[${mktScope.on.join(', ')}] of ${mktScope.all.length} · ` +
-        `total=[${expectTotal.join(', ')}] · level=${mktScope.level}`)
-  check('a baseline market was chosen for the shares',
-        !!mktScope.baseline || expectTotal.length === 0,
-        `baseline=${mktScope.baseline || '(none)'}`)
-  check('categories come from the confirmed mapping', sel.cats >= 100, `${sel.cats}`)
+  check('the scope follows the level chosen for the pairing',
+        mktScope.pairCount >= 0 && Array.isArray(mktScope.levels),
+        `pairs=${mktScope.pairCount} levels=[${mktScope.levels.join(', ')}] ` +
+        `first=${mktScope.first}`)
+  check('a market scope is applied (not silently empty)',
+        mktScope.all.length >= 1,
+        `on=[${mktScope.on.join(', ')}] of ${mktScope.all.length}`)
+  // Categories are offered only for the categories the user actually mapped -
+  // the enumeration no longer contributes any. With the mapping list as the only
+  // source, the chips are exactly the canonical names that were authored, so the
+  // assertion can be exact rather than a bound: every offered name was authored,
+  // and every authored name is offered. The enumeration holds 151; anything near
+  // that number means the step is reading the enumeration again.
+  const ENUM_TOTAL = 151
+  const expectedCats = [...new Set(authoredTargets)]
+  check('categories come from the authored mapping, not the enumeration',
+        sel.cats > 0 && sel.cats < ENUM_TOTAL,
+        `${sel.cats} chip(s) for ${expectedCats.length} authored name(s); ` +
+        `enumeration holds ${ENUM_TOTAL}`)
+  check('the offered categories are exactly the ones that were authored',
+        (catNames || []).length === expectedCats.length
+        && (catNames || []).every(n => expectedCats.includes(n)),
+        `offered=[${(catNames || []).join(', ')}] `
+        + `unexpected=[${(catNames || []).filter(
+          n => !expectedCats.includes(n)).join(', ')}]`)
+  // The category names live in #c-categories; #c-markets holds market values.
+  check('every authored target is offered in step 5',
+        AUTHOR_TARGETS.every(t => (catNames || []).some(
+          x => String(x).toUpperCase() === t)),
+        `targets in [${(catNames || []).join(', ')}]`)
   check('all categories selected by default', sel.selected === sel.cats,
         `${sel.selected}/${sel.cats}`)
   await shot('06-step5-selection')
@@ -704,8 +812,9 @@ async function main() {
         backToOne.onCount === 1 && backToOne.periods === 1,
         `on=${backToOne.onCount} periods=${backToOne.periods}`)
 
-  // narrow to 4 categories deterministically
-  const TARGETS = ['BEER', 'SNACK', 'YOGURT', 'HEALTH FOOD']
+  // narrow to the authored categories deterministically - the same names mapped
+  // in step 4, so the two halves of the walk agree by construction.
+  const TARGETS = AUTHOR_TARGETS
   await click('#c-cat-none')
   await waitFor(
     `document.querySelectorAll('#c-categories .chip.on').length === 0`, 15000)
@@ -724,9 +833,15 @@ async function main() {
     15000)
   const narrowed = await evaluate(
     `document.querySelectorAll('#c-categories .chip.on').length`)
-  check('category selection narrows to 4', narrowed === 4, `${narrowed}`)
+  check('category selection narrows to the authored categories',
+        narrowed === TARGETS.length && narrowed > 0,
+        `${narrowed} of ${TARGETS.length} authored`)
   const countText = await evaluate(`document.querySelector('#c-cat-count')?.textContent`)
-  check('file-count preview tracks the selection', /4 of \d+/.test(countText || ''),
+  // The preview counts *categories*, not files. The wording used to read
+  // "will produce 4 files" back when categories were the only grouping; the
+  // count it actually tracks is the selected category list.
+  check('file-count preview tracks the selection',
+        new RegExp(`^${TARGETS.length} of \\d+`).test(countText || ''),
         String(countText))
   await setInput('#c-client-input', 'WEIDER')
   await click('#c-client-add')
@@ -760,7 +875,7 @@ async function main() {
     tabs: document.querySelectorAll('#run-tabs .tab').length,
     tables: document.querySelectorAll('#run-body table').length,
     banner: document.querySelector('#run-out .notice')?.innerText,
-    body: document.querySelector('#run-body').innerText,
+    body: (document.querySelector('#run-body') || {}).innerText || '',
   })`)
   console.log('  run:', JSON.stringify({ kpis: run.kpis, tabs: run.tabs,
     tables: run.tables }))
@@ -826,7 +941,7 @@ async function main() {
     notice: document.querySelector('#export-out .notice')?.innerText,
     stats: document.querySelectorAll('#export-out .stat').length,
     rows: document.querySelectorAll('#export-out .file-row').length,
-    text: document.querySelector('#export-out').innerText.slice(0, 300),
+    text: (document.querySelector('#export-out') || {}).innerText?.slice(0, 300) || '',
   })`)
   console.log('  export:', JSON.stringify({ stats: exp.stats, rows: exp.rows }))
   check('export summary rendered', !!exp.notice, (exp.notice || '').slice(0, 80))

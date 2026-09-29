@@ -21,7 +21,8 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-WORKBOOK = os.path.join(os.path.dirname(ROOT), "TW Impact Study_V2 1 (1).xlsx")
+# The reference workbook ships inside the project root.
+WORKBOOK = os.path.join(ROOT, "TW Impact Study_V2 1 (1).xlsx")
 
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -77,7 +78,12 @@ def main() -> int:
           f" | {ms['n_pairs']} pairing(s) authored"
           f" | hierarchy {mk.get('paths_used')}")
     market_pairs = [{"market_a": TOTAL_A, "market_b": TOTAL_A, "level": "total"}]
-    mapping_a = {TOTAL_A: TOTAL_A}
+    # The dimension map is nested: dimension -> {A value: B value}. The market
+    # pairing is the only dimension mapping now; B's own map is the identity,
+    # because B already carries the target name. A flat {value: value} map is
+    # rejected by the request model (dict[str, dict[str, str]]).
+    mapping_a = {"market": {TOTAL_A: TOTAL_A}}
+    mapping_b = {"market": {TOTAL_A: TOTAL_A}}
 
     # step 4 — category enumeration. Nothing is decided for the user; this demo
     # authors identity rows because the reference workbook is already harmonised.
@@ -103,9 +109,15 @@ def main() -> int:
                         for u in cand],
         })
     n_mapped = sum(1 for r in authored if r["status"] == "mapped")
-    print(f"  category mapping: {n_mapped} of {len(authored)} categories mapped by "
-          f"the user, {cs['new_in_b']} new in B, "
-          f"coverage A {cs['a_coverage_pct']}% / B {cs['b_coverage_pct']}%")
+    # The coverage figures in the *enumeration* summary are necessarily 0 — that
+    # response reflects a state in which the user has mapped nothing yet. Reporting
+    # them next to the authored counts read as "0% coverage after mapping 151
+    # categories", which is not what they measure. Report the authored counts and
+    # the enumeration's own (correct) zero separately.
+    print(f"  category mapping: {n_mapped} of {len(authored)} categories authored as "
+          f"mapped, {cs['new_in_b']} new in B")
+    print(f"  enumeration summary (pre-authoring): coverage A {cs['a_coverage_pct']}% "
+          f"/ B {cs['b_coverage_pct']}% — by design, nothing is mapped yet")
     category_mapping = {"rows": authored, "new_in_b": cm["new_in_b"]}
 
     # step 5 — pick the largest categories
@@ -128,7 +140,7 @@ def main() -> int:
         "market_level": "total", "baseline_market": TOTAL_A,
         "categories": cats, "top_n": 10,
         "client_brands": ["WEIDER", "CENTRUM", "BLACKMORES", "DHC"],
-        "mapping_a": mapping_a, "mapping_b": {},
+        "mapping_a": mapping_a, "mapping_b": mapping_b,
         "category_mapping": category_mapping, "trend_enabled": False,
         "run_name": args.run_name, "include_excel": True, "include_pptx": True,
     })

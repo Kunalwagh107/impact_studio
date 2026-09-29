@@ -240,11 +240,41 @@ def source_columns(sid: str, sheet: str | None = None, header_row: int = 1,
                    limit: int = 200000):
     src = _get_source(sid)
     df = _load(src, sheet, header_row)
+    # The preview rows must be JSON-safe. `astype(str)` is not enough: on a
+    # float column carrying NaN, pandas 3 can leave the value as a float, and a
+    # bare NaN is rejected by the JSON encoder with
+    # "Out of range float values are not JSON compliant: nan" - which surfaced
+    # as a 500 on this endpoint the moment a caller read a sheet whose preview
+    # included a blank numeric cell. Fold every non-finite / missing value to ""
+    # explicitly instead of trusting the cast.
+    head = df.head(5)
+    records = [
+        {str(k): _json_cell(v) for k, v in row.items()}
+        for row in head.to_dict(orient="records")
+    ]
     return {
         "columns": [str(c) for c in df.columns],
         "rows": int(len(df)),
-        "head": df.head(5).astype(str).to_dict(orient="records"),
+        "head": records,
     }
+
+
+def _json_cell(v: Any) -> str:
+    """A preview cell as a JSON-safe string. Missing / NaN / NaT -> ""."""
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+            return ""
+    except Exception:
+        pass
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        # pd.isna on a list/array returns an array, which is not a bool.
+        pass
+    return str(v)
 
 
 @app.get("/api/source/{sid}/values")
@@ -1006,7 +1036,8 @@ def run(req: RunRequest):
     cfg = prep.cfg
     qc_rep = QC.run_qc(reports, cfg, df_a, df_b,
                        mapping_results=_mapping_results_from_request(req),
-                       cfgs_by_metric=cfgs_by_metric)
+                       cfgs_by_metric=cfgs_by_metric,
+                       category_mapping=req.category_mapping)
     return {
         "n_categories": len(reports),
         "categories": [r["category"] for r in reports],
@@ -1056,7 +1087,8 @@ def export(req: ExportRequest):
 
     qc_global = QC.run_qc(reports, cfg, df_a, df_b,
                           mapping_results=_mapping_results_from_request(req),
-                          cfgs_by_metric=cfgs_by_metric)
+                          cfgs_by_metric=cfgs_by_metric,
+                          category_mapping=req.category_mapping)
     produced: dict[str, dict] = {}
     files: list[dict] = []
 
@@ -1098,7 +1130,8 @@ def export(req: ExportRequest):
     # export-completeness check now that files exist
     qc_final = QC.run_qc(reports, cfg, df_a, df_b, produced=produced,
                          mapping_results=_mapping_results_from_request(req),
-                         cfgs_by_metric=cfgs_by_metric)
+                         cfgs_by_metric=cfgs_by_metric,
+                         category_mapping=req.category_mapping)
 
     # run-level index workbook
     index_path = os.path.join(run_dir, "00_QC_and_Index.xlsx")

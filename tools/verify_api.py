@@ -194,8 +194,15 @@ def main() -> int:
           str(sorted({r["status"] for r in cm["rows"]})))
     check("no automatic match rate is reported", "auto_rate_pct" not in cs,
           "the field is gone")
-    check("new categories in B are reported, not dropped", cs["new_in_b"] == 2,
-          f"{cs['new_in_b']}")
+    # `new_in_b` counts B *units* that no A unit claims. It is 0 here by
+    # construction: this workbook's A side has an entirely empty SUBCATEGORY
+    # column, and `_clean` folds blanks, so every A unit is a bare category and
+    # every B category is claimed by the same-named A category. A non-zero value
+    # needs a B-only category, which is exercised by the synthetic fixtures in
+    # verify_e2e.py / verify_user_mapping.py rather than by this file.
+    check("new-in-B is reported as a count, and is 0 for this harmonised file",
+          cs["new_in_b"] == 0,
+          f"{cs['new_in_b']} (0 expected: names match on both sides)")
     check("B units are offered as pickable targets", cs["n_b"] > 100,
           f"{cs['n_b']}")
     check("category rows carry an editable target list and a hint",

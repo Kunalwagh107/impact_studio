@@ -140,26 +140,27 @@
   <div id="map-out"></div>
   <div class="actions">
     <button class="btn ghost" data-goto="2">← Back</button>
-    <button class="btn primary" id="btn-catmap">Map all categories →</button>
+    <button class="btn primary" id="btn-catmap">Map categories →</button>
   </div>
 </section>
 
 <!-- ================= STEP 4 ================= -->
 <section class="panel" data-panel="4" hidden>
   <div class="panel-head">
-    <h2>4 · Map the categories, then generate the impacts</h2>
-    <p>One action reads the category structure of both datasets and opens the
-       editor. Define how each category in the previous dataset corresponds to the
-       updated one — a single category there, a category <em>plus a subcategory</em>,
-       several of them, or nothing at all. Names are never assumed to be equal, and
-       nothing is mapped on your behalf. When you are done, the impact analysis runs
-       on what you defined. A category you leave unmapped is not analysed: it has no
-       counterpart to compare against.</p>
+    <h2>4 · Category mapping</h2>
+    <p>Define how a category in the previous dataset corresponds to a category in
+       the updated one. Click <strong>+ Mapping</strong>, choose the Dataset&nbsp;1
+       category, choose the Dataset&nbsp;2 category it maps to, then click
+       <strong>Done</strong> — that is the whole step. Either side may be a bare
+       category or a category plus a subcategory, and one mapping may cover
+       several Dataset&nbsp;2 entries. Nothing is mapped for you: a category you
+       have not mapped has no counterpart to compare against and is left out of
+       the analysis.</p>
   </div>
   <div id="catmap-out"></div>
   <div class="actions">
     <button class="btn ghost" data-goto="3">← Back</button>
-    <button class="btn primary" id="btn-select">Run the impact analysis →</button>
+    <button class="btn primary" id="btn-select">Continue to selection →</button>
   </div>
 </section>
 
@@ -216,7 +217,7 @@
       <div class="field">
         <label>Category — select one, several, or all for bulk export</label>
         <div class="row">
-          <input type="search" id="c-cat-search" placeholder="filter categories…">
+          <span class="spacer"></span>
           <button class="btn small" id="c-cat-all">All</button>
           <button class="btn small" id="c-cat-none">None</button>
         </div>

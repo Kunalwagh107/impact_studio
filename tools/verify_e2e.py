@@ -16,6 +16,7 @@ Run:  python tools/verify_e2e.py
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import sys
 import time
@@ -249,10 +250,30 @@ def part1() -> None:
               f"{share_sum:.4f}%")
 
     # --- Top-N and client brands -------------------------------------------
+    # The Top-N is drawn from the PREVIOUS dataset, so the block is ordered by
+    # the before value. Two independent things are asserted here: the ordering
+    # is by A, and every member is genuinely A's largest - which is a stronger
+    # claim than "the list is descending", because a list can be descending and
+    # still be the wrong ten.
     mt = hf.get("manufacturer_top_n") or []
     check("manufacturer Top-N is correctly sized", len(mt) == 10, f"{len(mt)} rows")
-    vals_desc = [b["after_current"] for b in mt if b["after_current"] is not None]
-    check("Top-N sorted descending", vals_desc == sorted(vals_desc, reverse=True))
+    vals_desc = [b["before_current"] for b in mt if b["before_current"] is not None]
+    check("Top-N sorted descending by the previous dataset",
+          vals_desc == sorted(vals_desc, reverse=True))
+    check("every Top-N member's before-rank is inside the cut",
+          all((b.get("rank_before") or 99) <= 10 for b in mt),
+          f"ranks {[b.get('rank_before') for b in mt]}")
+    # Compare against a recomputation straight off the prepared frame.
+    _mblock = A._entity_block(
+        prep.a[prep.a["category"] == "HEALTH FOOD"],
+        prep.b[prep.b["category"] == "HEALTH FOOD"],
+        "manufacturer", False, None, "Sales Value")
+    _top_a = (_mblock[_mblock["manufacturer"].astype(str).str.len() > 0]
+              .sort_values("a_current", ascending=False, na_position="last")
+              .head(10)["manufacturer"].tolist())
+    check("the block is exactly A's ten largest manufacturers",
+          [b["name"] for b in mt] == _top_a,
+          f"report={[b['name'] for b in mt][:3]}… recomputed={_top_a[:3]}…")
     moves = {}
     for b in mt:
         moves[b["movement"]] = moves.get(b["movement"], 0) + 1
@@ -464,6 +485,72 @@ def part3() -> None:
           qc4.checks[-1].status == QC.FAIL,
           f"status={qc4.checks[-1].status}")
 
+    # --- category totals must reconcile THROUGH the mapping ----------------
+    # The case the check used to get wrong: a canonical category whose raw
+    # members are named differently on each side, which is the whole point of
+    # the category mapping. Comparing the two raw definitions directly skipped
+    # or failed on data that is correct.
+    #
+    # Dataset A: two raw units ("SNACKS / CHIPS", "SNACKS / NUTS") fold into
+    # the canonical "Snacks" - the user authors one row per unit, sharing the
+    # canonical name. Dataset B names the counterpart "SAVOURY / CHIPS".
+    src_a = pd.DataFrame({
+        "CATEGORY": ["SNACKS", "SNACKS", "OTHER"],
+        "SUBCATEGORY": ["CHIPS", "NUTS", ""],
+        "Sales Value": [110.0, 120.0, 999.0],
+    })
+    src_b = pd.DataFrame({
+        "CATEGORY": ["SAVOURY", "OTHER"],
+        "SUBCATEGORY": ["CHIPS", ""],
+        "Sales Value": [270.0, 999.0],
+    })
+    mapped = A.AnalysisConfig(top_n=5, category_col="CATEGORY",
+                              subcategory_col="SUBCATEGORY",
+                              category_col_b="CATEGORY",
+                              subcategory_col_b="SUBCATEGORY",
+                              a_current="Sales Value", b_current="Sales Value")
+    cm_rows = [
+        {"source": "SNACKS", "source_sub": "CHIPS", "canonical": "Snacks",
+         "status": "mapped",
+         "targets": [{"category": "SAVOURY", "subcategory": "CHIPS"}]},
+        {"source": "SNACKS", "source_sub": "NUTS", "canonical": "Snacks",
+         "status": "mapped",
+         "targets": [{"category": "SAVOURY", "subcategory": "CHIPS"}]},
+    ]
+
+    class _CM:  # the shape run_qc receives
+        rows = cm_rows
+
+    good_map = {"category": "Snacks",
+                "total": {"before_current": 230.0, "after_current": 270.0}}
+    bad_map = {"category": "Snacks",
+               "total": {"before_current": 999.0, "after_current": 270.0}}
+
+    qc_m1 = QC.QCReport()
+    QC.check_category_totals([good_map], src_a, src_b, mapped, qc_m1,
+                             category_mapping=_CM)
+    check("category totals PASS when a merge/1:N reconciles through the mapping",
+          qc_m1.checks[-1].status == QC.PASS,
+          f"status={qc_m1.checks[-1].status} · {qc_m1.checks[-1].message[:70]}")
+
+    qc_m2 = QC.QCReport()
+    QC.check_category_totals([bad_map], src_a, src_b, mapped, qc_m2,
+                             category_mapping=_CM)
+    check("category totals FAIL when a mapped category total is wrong",
+          qc_m2.checks[-1].status == QC.FAIL,
+          f"status={qc_m2.checks[-1].status}")
+
+    # And the mutation that used to survive: the raw-name comparison. Without
+    # the mapping, the canonical name matches no raw row on B, so the old code
+    # silently compared only A's partial match. Assert the mapped path is what
+    # makes it pass, by showing the unmapped path does NOT confirm the value.
+    qc_m3 = QC.QCReport()
+    QC.check_category_totals([good_map], src_a, src_b, mapped, qc_m3)
+    check("without the mapping the canonical total is not verified against B",
+          qc_m3.checks[-1].status != QC.PASS or
+          qc_m3.checks[-1].detail.get("via_mapping") is not True,
+          f"status={qc_m3.checks[-1].status}")
+
     # A check that cannot run must not report PASS - that would be a claim it
     # never verified.
     qc4b = QC.QCReport()
@@ -473,16 +560,61 @@ def part3() -> None:
           f"status={qc4b.checks[-1].status} msg={qc4b.checks[-1].message[:60]}")
 
     # --- Top-N must catch an oversized block -------------------------------
+    # The block is selected and ordered on the previous dataset, so the fixture
+    # carries before_current / rank_before - the fields the check now reads.
     qc5 = QC.QCReport()
     QC.check_topn([{"category": "X", "manufacturer_top_n":
-                    [{"after_current": 10.0, "rank_after": 1}] * 7}], cfg, qc5)
+                    [{"before_current": 10.0, "after_current": 12.0,
+                      "rank_before": 1, "rank_after": 1}] * 7}], cfg, qc5)
     check("Top-N FAILS when the block exceeds N",
           qc5.checks[-1].status == QC.FAIL, f"status={qc5.checks[-1].status}")
+
+    # ...and must catch a member whose A-rank sits outside the cut, which is the
+    # failure mode the "select on A" change makes possible to get wrong.
+    qc5c = QC.QCReport()
+    QC.check_topn([{"category": "X", "manufacturer_top_n":
+                    [{"before_current": 10.0, "after_current": 1.0,
+                      "rank_before": 25, "rank_after": 90}]}], cfg, qc5c)
+    check("Top-N FAILS when a member's before-rank is outside the cut",
+          qc5c.checks[-1].status == QC.FAIL, f"status={qc5c.checks[-1].status}")
 
     qc5b = QC.QCReport()
     QC.check_topn([{"category": "X"}], cfg, qc5b)
     check("Top-N reports NOT-VERIFIED when no blocks exist",
           qc5b.checks[-1].status == QC.WARN, f"status={qc5b.checks[-1].status}")
+
+    # --- Top-N is selected on the PREVIOUS dataset, then followed into B ---
+    # The case that separates the two rules: an entity that led in A and
+    # collapsed in B must still be in the block (it is part of the movement the
+    # report exists to surface), and an entity that leads only in B must not
+    # displace it. The reference workbook is harmonised, so its two selections
+    # coincide and cannot prove this - a synthetic block is required.
+    _blk = pd.DataFrame({
+        "manufacturer": ["ALPHA", "BRAVO", "CHARLIE", "OMEGA"],
+        "a_current":    [100.0,   50.0,    10.0,      5.0],
+        "b_current":    [1.0,     55.0,    12.0,      500.0],
+        "a_prior":      [90.0,    48.0,    9.0,       4.0],
+        "b_prior":      [95.0,    50.0,    10.0,      100.0],
+        "before_growth_pct": [None] * 4, "after_growth_pct": [None] * 4,
+        "level_shift_pp": [None] * 4, "before_share_pct": [None] * 4,
+        "after_share_pct": [None] * 4, "share_change_pp": [None] * 4,
+        "abs_change": [0.0] * 4, "contribution_to_change_pct": [None] * 4,
+        "metric": ["Sales Value"] * 4,
+    })
+    _top, _ = A._rank_block(_blk, "manufacturer", 2)
+    _names = [t["name"] for t in _top]
+    check("Top-N takes the largest from the previous dataset",
+          _names == ["ALPHA", "BRAVO"], f"selected {_names}")
+    check("an entity that led in A and collapsed in B is kept, not dropped",
+          "ALPHA" in _names
+          and next(t for t in _top if t["name"] == "ALPHA")["movement"] == "LOST",
+          f"ALPHA movement={next(t for t in _top if t['name'] == 'ALPHA')['movement']}")
+    check("an entity that leads only in the updated dataset does not displace it",
+          "OMEGA" not in _names, f"OMEGA present={('OMEGA' in _names)}")
+    check("the block is ordered by the previous dataset",
+          [t["before_current"] for t in _top]
+          == sorted([t["before_current"] for t in _top], reverse=True),
+          f"{[t['before_current'] for t in _top]}")
 
     # --- percentages must catch a wrong growth rate ------------------------
     qc6 = QC.QCReport()
@@ -633,8 +765,13 @@ def part4() -> None:
           s["composite"] == 3, f"composite={s['composite']}")
     # `by` was snapshotted before authoring, so it still shows the enumerated
     # state. Read the method off the authored rows to test what it describes.
+    # Only the dataclass fields go back in - a row dict also carries the derived
+    # `method` / `b_sum` / `delta_pct`, which are not constructor arguments.
+    _FIELDS = {f.name for f in dataclasses.fields(CM.CategoryMapRow)}
+    def _row_method(r):
+        return CM.CategoryMapRow(**{k: v for k, v in r.items() if k in _FIELDS}).method
     authored_by = {r["source"]: r for r in rows}
-    methods = {src: CM.CategoryMapRow(**r).method for src, r in authored_by.items()}
+    methods = {src: _row_method(r) for src, r in authored_by.items()}
     check("the reported method describes the mapping, it is not a score",
           methods["Biscuits"] == "1:1 (category + subcategory)"
           and methods["Snacks"] == "1:2"

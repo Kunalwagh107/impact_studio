@@ -229,7 +229,9 @@ def _independent_category_total(df: pd.DataFrame, cat_col: str, category: str,
                                 is_rate: bool = False,
                                 weight_col: str | None = None,
                                 market_col: str = "",
-                                markets: Sequence[str] | None = None) -> float | None:
+                                markets: Sequence[str] | None = None,
+                                members: Sequence[tuple[str, str]] | None = None,
+                                sub_col: str = "") -> float | None:
     """Second derivation of a category total, via a mask rather than a groupby.
 
     A rate metric (``ND Dist``) is a percentage: the pipeline averages it,
@@ -242,10 +244,43 @@ def _independent_category_total(df: pd.DataFrame, cat_col: str, category: str,
     ``markets`` narrows the recomputation to the market scope the report was
     built on. Without it, a report scoped to the Total Market is compared
     against a total over every market and fails on data that is right.
+
+    ``members`` is the *category mapping*, and it is the reason this check used
+    to fail on a workbook whose two datasets define categories differently. The
+    report's category is a **canonical** name; the source frame carries **raw**
+    names. When the user maps several raw units onto one canonical category -
+    a merge, a 1:N, or a category+subcategory composite - masking the raw frame
+    on the canonical string either finds nothing (and silently skips) or finds
+    only the one raw unit that happens to share the name (and fails on a
+    correct total). Comparing the two category *definitions* directly is the
+    error. So when ``members`` is given, the mask is the **union of the mapped
+    raw ``(category, subcategory)`` units**, which is exactly the set the
+    analysis grouped by. ``None`` members means "no mapping for this side", and
+    the raw-name mask is used unchanged.
     """
     if cat_col not in df.columns or metric_col not in df.columns:
         return None
-    mask = df[cat_col].astype(str) == str(category)
+    if members is not None:
+        want = {(_s(c), _s(sub)) for c, sub in members}
+        use_sub = bool(sub_col and sub_col in df.columns)
+        if use_sub:
+            pairs = list(zip(df[cat_col].map(_s), df[sub_col].map(_s)))
+            keep = np.array([p in want for p in pairs], dtype=bool)
+        elif any(sub for _, sub in want):
+            # A composite member was mapped, but this side has no subcategory
+            # column to key it by. Matching on the category alone would fold
+            # every subcategory of that category into the total, so report
+            # "cannot verify" rather than a total that is not the one compared.
+            cats_only = {c for c, _ in want}
+            sub_side = df[cat_col].map(_s)
+            if sub_side.isin(cats_only).any():
+                return None
+            keep = np.zeros(len(df), dtype=bool)
+        else:
+            keep = df[cat_col].map(_s).isin({c for c, _ in want}).to_numpy(dtype=bool)
+        mask = pd.Series(keep, index=df.index)
+    else:
+        mask = df[cat_col].astype(str) == str(category)
     if market_col and markets and market_col in df.columns:
         mask = mask & df[market_col].astype(str).isin([str(m) for m in markets])
     v = pd.to_numeric(df.loc[mask, metric_col], errors="coerce")
@@ -268,8 +303,63 @@ def _independent_category_total(df: pd.DataFrame, cat_col: str, category: str,
     return float(np.nansum(v.to_numpy(dtype="float64", na_value=np.nan)))
 
 
+def _s(v) -> str:
+    """The blank-folding string the analysis uses for a (category, sub) half.
+
+    Mirrors ``category_mapping._clean`` closely enough for a mask: a None / NaN
+    half and the literal "nan" all mean "no value", and must compare equal or the
+    member test misses exactly the rows the analysis kept.
+    """
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and v != v:
+            return ""
+    except Exception:
+        pass
+    s = str(v).strip()
+    return "" if s.lower() in ("", "nan", "none", "null", "<na>", "n/a", "-") else s
+
+
+def _canonical_members(category_mapping, side: str) -> dict[str, list[tuple[str, str]]]:
+    """canonical category -> the raw units the mapping folds into it, one side.
+
+    Rebuilt from the *user-authored* rows, so it is the same set ``resolve()``
+    handed the analysis. Only the rows that actually reach the analysis are
+    counted: a mapped A row contributes its own source unit; the B side
+    contributes that row's targets (which is how a merge, a 1:N and a
+    category+subcategory composite all arrive). Excluded and unmapped rows are
+    deliberately absent - nothing was reported for them, so there is nothing to
+    reconcile.
+    """
+    out: dict[str, list[tuple[str, str]]] = {}
+    if not category_mapping:
+        return out
+    rows = getattr(category_mapping, "rows", None) or []
+    for r in rows:
+        status = (r.get("status") or "").strip()
+        if status != "mapped":
+            continue
+        canonical = (r.get("canonical") or "").strip()
+        if not canonical:
+            canonical = _label(str(r.get("source") or ""), str(r.get("source_sub") or ""))
+        if side == "a":
+            out.setdefault(canonical, []).append(
+                (str(r.get("source") or ""), str(r.get("source_sub") or "")))
+        else:
+            for t in (r.get("targets") or []):
+                out.setdefault(canonical, []).append(
+                    (str(t.get("category") or ""), str(t.get("subcategory") or "")))
+    return out
+
+
+def _label(category: str, subcategory: str = "") -> str:
+    return f"{category} / {subcategory}" if subcategory else str(category)
+
+
 def check_category_totals(reports: Sequence[dict], df_a, df_b, cfg,
-                          qc: QCReport, cfgs_by_metric: dict | None = None) -> None:
+                          qc: QCReport, cfgs_by_metric: dict | None = None,
+                          category_mapping=None) -> None:
     """Category totals must reconcile with an independent recomputation.
 
     The report's total is produced by a groupby over the prepared frame; this
@@ -280,10 +370,23 @@ def check_category_totals(reports: Sequence[dict], df_a, df_b, cfg,
     columns would report failures on correct data, so each metric block is
     reconciled against **its own** wiring (``cfgs_by_metric``), and only the
     fallback single-metric path uses the bare ``cfg``.
+
+    ``category_mapping`` is the user-authored mapping. When supplied, each
+    canonical category's expected total is recomputed from the **union of its
+    mapped raw member units** on each side, rather than from the canonical name
+    matched against raw rows. That is what lets a merge, a 1:N, or a
+    category+subcategory composite reconcile: the two datasets define categories
+    differently, and comparing those definitions directly is the bug this
+    parameter exists to fix.
     """
     worst = PASS
     bad = []
     checked = 0
+
+    members_a = _canonical_members(category_mapping, "a")
+    members_b = _canonical_members(category_mapping, "b")
+    has_mapping = bool(members_a or members_b)
+    newly_unverifiable = 0
 
     # (label, per-metric total, columns, is_rate, weights) tuples to verify.
     def blocks_for(rep: dict):
@@ -302,18 +405,51 @@ def check_category_totals(reports: Sequence[dict], df_a, df_b, cfg,
         for label, tot, c in blocks_for(rep):
             if not c or not c.category_col or c.category_col not in df_a.columns:
                 continue
-            for side, df, col in (("before", df_a, c.a_current),
-                                  ("after", df_b, c.b_current)):
+            for side, df, col, sub_col, members in (
+                    ("before", df_a, c.a_current, c.category_col, members_a),
+                    ("after", df_b, c.b_current,
+                     (getattr(c, "category_col_b", "") or c.category_col),
+                     members_b)):
                 if not col or col not in df.columns:
                     continue
+                # When a mapping exists and this category has members on this
+                # side, mask on the union of those members. A category absent
+                # from the member map on this side (mapped on the other side
+                # only) keeps the raw-name mask, which will normally find
+                # nothing and be skipped - correct, since that side has no rows
+                # for it.
+                mem = members.get(cat) if (has_mapping and cat in members) else None
+                msub = ""
+                if mem is None:
+                    # No mapping for this category on this side. Fall back to
+                    # the raw name, but only when the mapping does not also
+                    # cover this category on the other side - otherwise the two
+                    # sides would be reconciled against different definitions.
+                    other = (members_b if side == "before" else members_a).get(cat)
+                    if has_mapping and other is not None:
+                        # This side has no members but the report printed a
+                        # total for it. That is a genuine mismatch worth failing,
+                        # not skipping, so mask to nothing and let it compare.
+                        mem = []
+                else:
+                    use_sub = (getattr(c, "subcategory_col", "") if side == "before"
+                               else (getattr(c, "subcategory_col_b", "")
+                                     or getattr(c, "subcategory_col", "")))
+                    msub = use_sub if use_sub in df.columns else ""
                 expected = _independent_category_total(
                     df, c.category_col, cat, col,
                     is_rate=c.is_rate,
                     weight_col=c.weight_metric if side == "before" else
                                (c.weight_metric_b or c.weight_metric),
-                    market_col=c.market_col, markets=c.markets)
+                    market_col=c.market_col, markets=c.markets,
+                    members=mem, sub_col=msub)
                 got = tot.get(f"{side}_current")
                 if expected is None:
+                    # The recomputation could not be performed for a reported
+                    # value. That is "not verified", not PASS, and not FAIL -
+                    # counted so the summary can say so.
+                    if got is not None:
+                        newly_unverifiable += 1
                     continue
                 checked += 1
                 if got is None:
@@ -326,7 +462,7 @@ def check_category_totals(reports: Sequence[dict], df_a, df_b, cfg,
                 if rel > 1e-6:
                     bad.append({"category": cat, "side": side, "metric": label,
                                 "reported": got, "recomputed": expected,
-                                "rel_diff": rel})
+                                "rel_diff": rel, "members": mem})
                     worst = FAIL
     if checked == 0:
         # Nothing was actually compared, so PASS would be a false claim.
@@ -337,15 +473,21 @@ def check_category_totals(reports: Sequence[dict], df_a, df_b, cfg,
         return
     if worst == PASS:
         how = "weighted mean" if cfg.is_rate else "total"
+        msg = (f"All {checked} category {how}(s) reconcile with an independent "
+               "recomputation from the source rows (rel. tol 1e-6)")
+        if has_mapping:
+            msg += (", with each canonical category recomputed from the raw units "
+                    "its mapping folds together")
         qc.add("category_totals", "Category-level totals", PASS,
-               f"All {checked} category {how}(s) reconcile with an independent "
-               "recomputation from the source rows (rel. tol 1e-6).",
+               msg + ".",
                {"comparisons": checked, "is_rate": bool(cfg.is_rate),
+                "via_mapping": has_mapping,
                 "metrics": sorted((cfgs_by_metric or {}).keys()) or None})
     else:
         qc.add("category_totals", "Category-level totals", FAIL,
                f"{len(bad)} of {checked} category total(s) failed to reconcile.",
-               {"mismatches": bad[:25], "n": len(bad)})
+               {"mismatches": bad[:25], "n": len(bad),
+                "via_mapping": has_mapping})
 
 
 def check_percentages(reports: Sequence[dict], qc: QCReport) -> None:
@@ -393,7 +535,15 @@ def check_percentages(reports: Sequence[dict], qc: QCReport) -> None:
 
 
 def check_topn(reports: Sequence[dict], cfg, qc: QCReport) -> None:
-    """Top-N blocks must be correctly sized and correctly ordered."""
+    """Top-N blocks must be correctly sized and correctly ordered.
+
+    The Top-N is selected on the **previous** dataset (``before_current``), so
+    the block is expected to be ordered descending by that column, not by the
+    updated one. Checking order against ``after_current`` was asserting the
+    wrong thing: a member that led in A and fell in B belongs in the block *and*
+    belongs at the top of it, because the block is "A's largest, followed into
+    B". The after values are carried as columns, not as the sort key.
+    """
     worst = PASS
     bad = []
     checked = 0
@@ -407,15 +557,18 @@ def check_topn(reports: Sequence[dict], cfg, qc: QCReport) -> None:
                 bad.append({"category": rep["category"], "block": key,
                             "n": len(block), "top_n": cfg.top_n})
                 worst = FAIL
-            vals = [b["after_current"] for b in block if b["after_current"] is not None]
+            vals = [b["before_current"] for b in block if b["before_current"] is not None]
             if vals != sorted(vals, reverse=True):
                 bad.append({"category": rep["category"], "block": key,
-                            "issue": "not sorted descending"})
+                            "issue": "not sorted descending by before_current"})
                 worst = FAIL
-            ranks = [b["rank_after"] for b in block if b["rank_after"] is not None]
-            if ranks and ranks != sorted(ranks):
+            # The block is the top of A, so every member's A rank must be inside
+            # the cut. A member with no A rank could only get here via a tie at
+            # the boundary, which is why this is a warning-grade check.
+            ranks = [b["rank_before"] for b in block if b["rank_before"] is not None]
+            if any(r > cfg.top_n for r in ranks):
                 bad.append({"category": rep["category"], "block": key,
-                            "issue": "ranks not ascending"})
+                            "issue": "a member's before-rank is outside the Top-N cut"})
                 worst = FAIL
     if checked == 0:
         qc.add("topn", "Top-N calculations", WARN,
@@ -425,9 +578,10 @@ def check_topn(reports: Sequence[dict], cfg, qc: QCReport) -> None:
         return
     if worst == PASS:
         qc.add("topn", "Top-N calculations", PASS,
-               f"Top-N blocks are within the configured N={cfg.top_n} and correctly "
-               f"ordered ({checked} block(s) checked).",
-               {"top_n": cfg.top_n, "blocks": checked})
+               f"Top-N blocks are within the configured N={cfg.top_n}, drawn from "
+               f"the previous dataset and correctly ordered "
+               f"({checked} block(s) checked).",
+               {"top_n": cfg.top_n, "blocks": checked, "basis": "a_current"})
     else:
         qc.add("topn", "Top-N calculations", FAIL,
                f"{len(bad)} Top-N anomaly(ies).", {"anomalies": bad[:25], "n": len(bad)})
@@ -590,13 +744,19 @@ def check_export_completeness(expected: Sequence[str], produced: dict,
 def run_qc(reports: Sequence[dict], cfg, df_a, df_b,
            mapping_results: dict | None = None,
            produced: dict | None = None,
-           cfgs_by_metric: dict | None = None) -> QCReport:
+           cfgs_by_metric: dict | None = None,
+           category_mapping=None) -> QCReport:
     """Run every check.
 
     ``cfgs_by_metric`` maps a metric key to the ``AnalysisConfig`` used to build
     that metric's block, and is only needed when a run carries several metrics.
     Each metric's totals are then reconciled against its own wiring rather than
     against the first metric's columns.
+
+    ``category_mapping`` is the user-authored mapping object (``rows`` /
+    ``targets``). It is passed to the totals check so a canonical category is
+    recomputed from the raw units its mapping folds together, which is what makes
+    a merge / 1:N / composite mapping reconcile instead of failing.
     """
     qc = QCReport()
     check_metric_wiring(cfg, df_a, df_b, qc)
@@ -604,7 +764,8 @@ def run_qc(reports: Sequence[dict], cfg, df_a, df_b,
     check_duplicates(df_a, df_b, cfg, qc)
     check_mapping_coverage(mapping_results or {}, qc)
     check_invalid_mappings(mapping_results or {}, qc)
-    check_category_totals(reports, df_a, df_b, cfg, qc, cfgs_by_metric)
+    check_category_totals(reports, df_a, df_b, cfg, qc, cfgs_by_metric,
+                          category_mapping=category_mapping)
     check_percentages(reports, qc)
     check_topn(reports, cfg, qc)
     check_before_after_consistency(reports, qc)

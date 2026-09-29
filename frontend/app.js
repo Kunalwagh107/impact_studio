@@ -21,24 +21,15 @@ const S = {
   marketPathsUsed: false,
   marketPathSource: '',
   marketLevel: 'total',
-  catmap: null,                     // enumerated category units, no targets
-  catmapEdits: {},                  // idx -> {canonical, targets, status}
+  catmap: null,                     // enumerated units + one-sided report
+  // The mappings the user has authored, in order. This list IS the step-4
+  // content: a mapping exists because the user clicked "+ Mapping", filled it in
+  // and pressed Done. Nothing else contributes a row.
+  catmapMaps: [],
+  // The mapping currently being edited, or null. Drafted as a copy so Cancel
+  // discards rather than reverting an aliased object.
+  catmapDraft: null,
   catmapTouched: false,
-  // View state for the category-mapping table. This has to outlive a re-render:
-  // editing a target used to rebuild the whole panel, which reset the filter and
-  // the "Show all" checkbox, so the row list appeared to collapse mid-edit.
-  catmapView: { showAll: false, search: '' },
-  // Focused category editor: which row is open. Also has to outlive a render,
-  // for the same reason as catmapView above. `null` means every accordion row is
-  // collapsed; on first arrival the step opens the first row that still needs a
-  // decision (see drawCatmapAccordion), and `catmapOpened` stops it re-opening
-  // one the user has deliberately closed.
-  catmapPick: null,
-  catmapOpened: false,
-  catmapOnlyOne: true,
-  // Accordion view state for the one-at-a-time editor: the filter box and the
-  // open row. Kept in state so an edit does not reset what the user typed.
-  catmapAcc: { search: '' },
   catmapIncludeNewInB: false,
   clientName: '',
   impactName: '',
@@ -53,8 +44,8 @@ const S = {
 };
 
 // A top-level `const` does not become a property of `window` (unlike `var` or a
-// function declaration), so the headless probes could reach `drawCatmapAccordion`
-// but not the state it reads. Expose it explicitly.
+// function declaration), so the headless probes could reach a function but not
+// the state it reads. Expose it explicitly.
 window.S = S;
 
 // ---------------------------------------------------------------------------
@@ -217,10 +208,27 @@ async function refreshColumns(side) {
     const cur = splitSel.value;
     splitSel.innerHTML = '<option value="">— none —</option>' +
       d.columns.map(c => `<option>${esc(c)}</option>`).join('');
-    if (cur && d.columns.includes(cur)) splitSel.value = cur;
-    $(`#${side}-summary`).innerHTML =
+    // Clear the value when the new sheet does not have that column, rather than
+    // leaving it selected. An <option> that is gone while the <select> still
+    // *reports* it as its value is stale state: `spec()` would send a column
+    // the sheet does not contain, and the next change event would fire a
+    // request that can only 400. Reset and say why.
+    if (cur && d.columns.includes(cur)) {
+      splitSel.value = cur;
+    } else if (cur) {
+      splitSel.value = '';
+      splitSel.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    // Written after the block above, which would otherwise overwrite them.
+    const summary = [];
+    if (cur && !d.columns.includes(cur)) {
+      summary.push(`<i>Column '${esc(cur)}' is not in this sheet — the split `
+                 + 'column was cleared.</i>');
+    }
+    summary.push(
       `<b>Rows:</b> ${fmtNum(d.rows)}\n<b>Columns:</b> ${d.columns.length}\n` +
-      `<b>First cols:</b> ${d.columns.slice(0, 6).map(esc).join(', ')}`;
+      `<b>First cols:</b> ${d.columns.slice(0, 6).map(esc).join(', ')}`);
+    $(`#${side}-summary`).innerHTML = summary.join('\n');
   } catch (e) {
     $(`#${side}-summary`).textContent = 'Error: ' + e.message;
   } finally { overlay(false); }
@@ -236,8 +244,22 @@ async function onSplitChange(side) {
   const hr = Number($(`#${side}-header`).value) || 1;
   const q = new URLSearchParams({ column: col, header_row: hr });
   if (sheet) q.set('sheet', sheet);
-  const d = await api(`/api/source/${sid}/values?${q}`);
-  $(`#${side}-value`).innerHTML = d.values.map(v => `<option>${esc(v)}</option>`).join('');
+  try {
+    const d = await api(`/api/source/${sid}/values?${q}`);
+    $(`#${side}-value`).innerHTML = d.values.map(v => `<option>${esc(v)}</option>`).join('');
+  } catch (e) {
+    // The split column can name a column the currently-selected sheet does not
+    // have. `refreshColumns` keeps the previous value in place when the new
+    // sheet lacks it, so changing sheets fires this handler with a column that
+    // is not there, and the request 400s. Fall back to "no split" rather than
+    // letting the rejection escape as an uncaught error: the picker stays
+    // visible and honest about which column it needs.
+    wrap.style.display = 'none';
+    $(`#${side}-value`).innerHTML = '';
+    $(`#${side}-summary`).textContent =
+      `Split column '${col}' is not in sheet '${sheet || '(default)'}' — `
+      + 'pick a column that exists here.';
+  }
 }
 
 function spec(side) {
@@ -408,7 +430,26 @@ const MKT_LEVELS = [
   ['region', 'Region'],
 ];
 
-async function doMarketMapping() {
+/**
+ * Read (or re-read) the market values and annotate the authored pairings.
+ *
+ * `adviceOnly` is the difference between the two callers, and it is the whole
+ * reason this step used to feel like it re-rendered on every click:
+ *
+ *   * A full call (`adviceOnly` false) is the one that *reads the values*. It
+ *     runs when the step is entered, when the wiring changes, and from the
+ *     explicit "Re-read the values" button. It rebuilds the panel.
+ *   * An advice-only call (`adviceOnly` true) is what a pairing change needs:
+ *     the value lists have not changed, so there is nothing to re-read - the
+ *     server is asked only to annotate the new pairing, and the panel is *not*
+ *     rebuilt. The row the user is editing keeps its focus and its open
+ *     dropdown, and no other row is touched.
+ *
+ * Re-rendering the whole panel for a pairing change was rebuilding the very
+ * `<select>` the user was interacting with on every keystroke-level choice,
+ * which is why it read as "renders unnecessarily every time I map".
+ */
+async function doMarketMapping(adviceOnly = false) {
   const a = spec('a'), b = spec('b');
   if (!a || !b) return;
   const mcol = S.dimCols.a.market || '';
@@ -417,7 +458,15 @@ async function doMarketMapping() {
     renderMarketPairing();
     return;
   }
-  overlay(true, 'Reading the market values on both sides…');
+  if (adviceOnly && S.marketAdvisory) {
+    // Paint the just-edited row immediately from local state - the value is
+    // already in S.marketPairs - then let the server's advice catch up without
+    // repainting anything. If the call fails, the row still shows what the user
+    // chose; only the advice stays blank for that row.
+    patchMarketRowAdvice();
+  } else {
+    overlay(true, 'Reading the market values on both sides…');
+  }
   try {
     const d = await api('/api/market-mapping', {
       method: 'POST',
@@ -435,12 +484,14 @@ async function doMarketMapping() {
     S.marketAdvisory = d;
     S.marketPathsUsed = !!d.paths_used;
     S.marketPathSource = d.path_source || '';
-    renderMarketPairing();
+    if (adviceOnly) patchMarketRowAdvice();
+    else renderMarketPairing();
   } catch (e) {
+    if (adviceOnly) return;
     const box = $('#map-out');
     if (box) box.innerHTML = `<div class="card"><div class="notice warn">
       The market values could not be read: ${esc(e.message)}</div></div>`;
-  } finally { overlay(false); }
+  } finally { if (!adviceOnly) overlay(false); }
 }
 
 /** Add an empty pairing; the user fills in both sides. */
@@ -448,6 +499,35 @@ function addMarketPair() {
   if (!S.marketPairs) S.marketPairs = [];
   S.marketPairs.push({ market_a: '', market_b: '', level: S.marketLevel || 'total' });
   renderMarketPairing();
+}
+
+/**
+ * Refresh only the advice cell of each pairing row, in place.
+ *
+ * The pairing table is otherwise untouched: the selects keep their nodes (so
+ * an open dropdown is not closed and focus is not lost) and no value list is
+ * re-read. This is what makes a pairing change a local edit rather than a
+ * full panel rebuild.
+ */
+function patchMarketRowAdvice() {
+  const pairs = S.marketPairs || [];
+  $$('#map-out tr[data-mkt-row]').forEach(tr => {
+    const i = Number(tr.dataset.mktRow);
+    const cell = tr.querySelector('td[data-mkt-advice]');
+    if (!cell) return;
+    cell.innerHTML = marketAdviceHtml(pairs[i]);
+  });
+}
+
+/** The advice text for one pairing, from the server's evidence on it. */
+function marketAdviceHtml(p) {
+  const ev = (p && p.evidence) || {};
+  if (ev.contradiction) return `<span class="neg">${esc(ev.contradiction)}</span>`;
+  if (ev.note) return esc(ev.note);
+  if (ev.child_of) {
+    return `sits under ${esc(Object.values(ev.child_of).flat().slice(0, 2).join(', '))}`;
+  }
+  return '';
 }
 
 function renderMarketPairing() {
@@ -549,12 +629,7 @@ function renderMarketPairing() {
           <th>Advice</th><th></th>
         </tr></thead><tbody>
         ${pairs.map((p, i) => {
-          const ev = p.evidence || {};
-          const note = ev.contradiction ? `<span class="neg">${esc(ev.contradiction)}</span>`
-            : ev.note ? esc(ev.note)
-            : ev.child_of ? `sits under ${esc(Object.values(ev.child_of).flat().slice(0, 2).join(', '))}`
-            : '';
-          return `<tr>
+          return `<tr data-mkt-row="${i}">
             <td><select data-mkt-a="${i}">
               <option value="">— choose an A value —</option>
               ${opts(aVals, p.market_a)}
@@ -571,7 +646,7 @@ function renderMarketPairing() {
               ${MKT_LEVELS.map(([v, lab]) =>
                 `<option value="${v}" ${p.level === v ? 'selected' : ''}>${esc(lab)}</option>`).join('')}
             </select></td>
-            <td class="hint" style="text-align:left;font-size:11px">${note}</td>
+            <td class="hint" style="text-align:left;font-size:11px" data-mkt-advice>${marketAdviceHtml(p)}</td>
             <td><button class="btn small ghost" data-mkt-del="${i}">×</button></td>
           </tr>`;
         }).join('')}
@@ -598,27 +673,34 @@ function renderMarketPairing() {
     sel.onchange = () => {
       const i = Number(sel.dataset.mktA);
       S.marketPairs[i] = { ...S.marketPairs[i], market_a: sel.value, evidence: null };
-      doMarketMapping();
+      // The value lists have not changed, so only this row's advice needs to
+      // catch up - no panel rebuild, no re-read of the values.
+      patchMarketRowAdvice();
+      doMarketMapping(true);
     };
   });
   $$('#map-out select[data-mkt-b]').forEach(sel => {
     sel.onchange = () => {
       const i = Number(sel.dataset.mktB);
       S.marketPairs[i] = { ...S.marketPairs[i], market_b: sel.value, evidence: null };
-      doMarketMapping();
+      patchMarketRowAdvice();
+      doMarketMapping(true);
     };
   });
   $$('#map-out select[data-mkt-level]').forEach(sel => {
     sel.onchange = () => {
+      // The level is carried into the analysis; it does not change any pairing's
+      // evidence, so there is nothing to ask the server and nothing to repaint.
       const i = Number(sel.dataset.mktLevel);
-      S.marketPairs[i] = { ...S.marketPairs[i], level: sel.value, evidence: null };
-      doMarketMapping();
+      S.marketPairs[i] = { ...S.marketPairs[i], level: sel.value };
     };
   });
   $$('#map-out [data-mkt-del]').forEach(btn => {
     btn.onclick = () => {
       S.marketPairs.splice(Number(btn.dataset.mktDel), 1);
-      doMarketMapping();
+      // A row left the table, so the numbering shifts and the panel is rebuilt -
+      // but from local state, without a server call.
+      renderMarketPairing();
     };
   });
 }
@@ -673,12 +755,9 @@ async function doCategoryMapping(metricOverride) {
     });
     S.catmap = d;
     S.catmapMetric = fam || '';
-    // A re-probe produces a fresh set of rows, so the focused row from the old
-    // set no longer means anything: start collapsed and let the editor re-open
-    // its entry row, rather than leaving a stale index pointing elsewhere.
-    S.catmapPick = null;
-    S.catmapOpened = false;
-    if (!S.catmapTouched) S.catmapEdits = {};
+    // A re-probe yields fresh unit lists, so any mapping still open must close:
+    // its draft refers to categories from the set that was just replaced.
+    S.catmapDraft = null;
     renderCatmap();
     go(4);
   } catch (e) {
@@ -690,19 +769,20 @@ async function doCategoryMapping(metricOverride) {
  * The single action the brief asks for: map the categories, then run the
  * analysis on what the user defined.
  *
- * First press reads the structure and opens the editor. If the user has already
- * authored a mapping, it goes straight to the analysis - they are not asked to
- * map the same thing twice. Any category they left unresolved is named before
- * the run, so a category disappearing from the numbers is never a surprise.
+ * First press reads the structure and opens the mapping step. If the user has
+ * already authored a mapping, it goes straight to the analysis - they are not
+ * asked to map the same thing twice. Any Dataset 1 category left uncovered is
+ * named before the run, so a category disappearing from the numbers is never a
+ * surprise.
  */
 async function mapAllCategories() {
   if (!S.catmap) { await doCategoryMapping(); return; }
   const unresolved = unresolvedCategories();
-  const mapped = S.catmap.rows.filter((_, i) => catmapRow(i).status === 'mapped').length;
+  const mapped = catmapList().length;
   if (!mapped) {
     alert('No category is mapped yet.\n\n'
-        + 'Attach at least one target to a Dataset-1 category before running the '
-        + 'analysis, so there is something to compare.');
+        + 'Add at least one mapping before running the analysis, so there is '
+        + 'something to compare.');
     go(4);
     return;
   }
@@ -721,875 +801,386 @@ async function mapAllCategories() {
   confirmCategoryMapping({ thenRun: true });
 }
 
-/** Categories the user has neither mapped nor excluded. */
-function unresolvedCategories() {
-  const rows = S.catmap?.rows || [];
-  return rows.map((_, i) => catmapRow(i))
-    .filter(r => r.status !== 'mapped' && r.status !== 'excluded')
-    .map(r => r.source + (r.source_sub ? ' / ' + r.source_sub : ''));
+// ---------------------------------------------------------------------------
+// step 4 — category mapping
+//
+// One thing, and the brief is explicit about it: the user defines how a
+// Dataset-1 category maps to a Dataset-2 category. Either side may be a bare
+// category or a category-plus-subcategory, and one mapping may point at several
+// Dataset-2 units. Nothing is mapped on the user's behalf, and the step lists
+// only what the user built - not an inventory of both datasets.
+//
+// Deliberately absent, because it was asked for this way: no per-row status
+// column, no "unmapped" inventory, no evidence hints, no confidence, no search
+// or filter, no one-row-at-a-time accordion over every category. A mapping's
+// existence IS the mapping.
+//
+//   [ + Mapping ]                         <- the only control
+//   card:  A side  ->  B side(s)  ->  reported as
+//   ...   click it: A picker, one-or-more B pickers, reported name
+//   [ Done ]   -> saved to the list above
+// ---------------------------------------------------------------------------
+
+/** The mappings the user has authored. */
+function catmapList() {
+  return S.catmapMaps || [];
 }
 
-function catmapRow(idx) {
-  const base = S.catmap.rows[idx];
-  const ed = S.catmapEdits[idx] || {};
-  // Every row starts with no target: the enumeration assigns none, and nothing
-  // here fills one in. `canonical` defaults to the category's own name so the
-  // analysis has something to report it under, but the row stays `unmapped`
-  // until the user attaches a target, and an unmapped row is not analysed.
-  return {
-    source: base.source,
-    source_sub: base.source_sub || '',
-    canonical: ed.canonical !== undefined
-      ? ed.canonical
-      : (base.canonical || base.source),
-    targets: ed.targets !== undefined
-      ? ed.targets
-      : (base.targets || []).map(t => ({ ...t })),
-    status: ed.status !== undefined ? ed.status : base.status,
-    method: base.method,
-    // Evidence, not a score. `hint` carries the closest name and the closest
-    // value so the user has something to look at; neither is applied.
-    hint: base.hint || {},
-    note: base.note || '',
-    a_total: base.a_total,
-    b_total: base.b_total,
-  };
+/** Unit key. Category and subcategory, folded so blanks never differ. */
+function ukey(cat, sub) {
+  return `${cat || ''}\x1f${sub || ''}`;
 }
 
-function cmSet(idx, patch) {
-  S.catmapEdits[idx] = { ...(S.catmapEdits[idx] || {}), ...patch };
-  S.catmapTouched = true;
+/** A unit's own key. */
+function akey(u) {
+  return ukey(u.category, u.subcategory || '');
 }
 
-/**
- * Whether the user has dealt with a row — mapped it or excluded it.
- *
- * This used to be `status === 'accepted'`, which meant "the app matched this
- * confidently". Nothing is matched confidently any more; a row is resolved
- * because the user made a call, and a row they have not dealt with is one the
- * analysis will leave out. The distinction matters: "needs review" now means
- * "you have not decided", not "the app is unsure".
- */
-function isResolved(idx) {
-  const st = catmapRow(idx).status;
-  return st === 'mapped' || st === 'excluded';
-}
-
-function renderCatmap() {
-  const cm = S.catmap;
-  const s = cm.summary || {};
-  const [scale, unit] = scaleOf(...cm.rows.map(r => r.a_total).filter(v => v),
-                              ...cm.rows.map(r => r.b_total).filter(v => v));
-
-  const bCats = Array.from(new Set((cm.b_units || []).map(u => u.category))).sort();
-  const subsFor = (cat) => Array.from(new Set(
-    (cm.b_units || []).filter(u => u.category === cat && u.subcategory)
-      .map(u => u.subcategory))).sort();
-  const allSubs = Array.from(new Set(
-    (cm.b_units || []).map(u => u.subcategory).filter(Boolean))).sort();
-  S._cmBCats = bCats;
-  S._cmSubsFor = subsFor;
-  S._cmAllSubs = allSubs;
-
-  const rows = cm.rows;
-  const attention = rows.map((r, i) => i)
-    .filter(i => !isResolved(i));
-
-  // If the panel shell already exists, do NOT rebuild it. Rebuilding replaced
-  // the search box and the "Show all" checkbox, throwing away whatever the user
-  // had typed or ticked - so editing one target reset the view and the list
-  // looked like it had collapsed. Redraw only the body, and only if asked.
-  if ($('#catmap-out') && $('#cm-tbl')) {
-    drawCatmapRows();
-    drawCatmapAccordion();
-    return;
-  }
-
-  $('#catmap-out').innerHTML = `
-    <div class="card">
-      <div class="card-head"><h3>How the two category structures line up</h3></div>
-      <p class="hint" style="margin:0 0 8px">
-        Nothing here is matched for you. Each Dataset-1 category starts with no
-        counterpart; you decide what it corresponds to. A category may map to one
-        category in the other dataset, to several, to a category plus a
-        subcategory, or to nothing at all — and several of yours may merge into one.
-        A category you leave unmapped is <em>not</em> analysed: it has no counterpart
-        to compare against, so it cannot produce an impact figure.
-      </p>
-      <div class="stat-grid">
-        <div class="stat"><div class="s-label">Categories in A</div>
-          <div class="s-value">${fmtNum(s.n_a)}</div></div>
-        <div class="stat"><div class="s-label">Category units in B</div>
-          <div class="s-value">${fmtNum(s.n_b)}</div></div>
-        <div class="stat"><div class="s-label">Mapped by you</div>
-          <div class="s-value">${fmtNum(s.mapped)}</div></div>
-        <div class="stat"><div class="s-label">Not mapped yet</div>
-          <div class="s-value ${attention.length ? 'neg' : ''}">${fmtNum(s.unmapped)}</div></div>
-        <div class="stat"><div class="s-label">Excluded</div>
-          <div class="s-value">${fmtNum(s.excluded)}</div></div>
-        <div class="stat"><div class="s-label">New in B</div>
-          <div class="s-value">${fmtNum(s.new_in_b)}</div></div>
-        <div class="stat"><div class="s-label">A value covered</div>
-          <div class="s-value">${fmtNum(s.a_coverage_pct, 1)}%</div></div>
-        <div class="stat"><div class="s-label">B value covered</div>
-          <div class="s-value">${fmtNum(s.b_coverage_pct, 1)}%</div></div>
-      </div>
-      ${s.composite || s.one_to_many || s.n_to_one ? `<div class="notice info">
-        ${s.composite ? `${s.composite} composite mapping(s) (a category here = category + subcategory there). ` : ''}
-        ${s.one_to_many ? `${s.one_to_many} one-to-many mapping(s) (one category here = several there). ` : ''}
-        ${s.n_to_one ? `${s.n_to_one} Dataset-2 target(s) shared by several Dataset-1 categories — those merge.` : ''}
-      </div>` : ''}
-      <div class="row" style="margin-top:12px">
-        <div class="field" style="margin:0;min-width:220px">
-          <label>Metric whose values are shown beside each category</label>
-          <select id="cm-metric">
-            ${Array.from(new Set([
-              ...Object.keys(S.profile.a.metric_families || {}),
-              ...Object.keys(S.profile.b.metric_families || {}),
-            ])).map(f => `<option ${S.catmapMetric === f ? 'selected' : ''}>${esc(f)}</option>`).join('')}
-          </select>
-        </div>
-        <button class="btn small" id="cm-reprobe">Re-read the categories</button>
-      </div>
-      <p class="hint">
-        The values are shown so you can judge a pairing for yourself. Alongside
-        each category you will see the closest name in the other dataset and the
-        closest value — both are <em>hints only</em>. Neither selects a target, and
-        a loose value match is not evidence of equivalence: the whole point of the
-        study is that the values moved.
-      </p>
-    </div>
-
-    <div class="card">
-      <div class="card-head"><h3>Map one category at a time</h3>
-        <span class="sub">expand a category to map it; only one is open at a time</span></div>
-      <div class="row">
-        <label class="check"><input type="checkbox" id="cm-onlyone"
-          ${S.catmapOnlyOne ? 'checked' : ''}> Work one category at a time</label>
-        <button class="btn small" id="cm-prev">← Previous</button>
-        <button class="btn small" id="cm-next">Next needing review →</button>
-        ${attention.length
-          ? `<button class="btn small" id="cm-open-next">Open next needing review (${attention.length})</button>`
-          : ''}
-        <span class="spacer"></span>
-        <label class="check"><input type="checkbox" id="cm-hideok"
-          ${S.catmapAcc.hideOk ? 'checked' : ''}> Hide confident matches</label>
-        <input type="search" id="cm-acc-search" placeholder="filter categories…"
-               value="${esc(S.catmapAcc.search || '')}" style="max-width:220px">
-      </div>
-      <p class="hint" style="margin:6px 0 0">
-        Each category is a row. Click the arrow (or the name) to <em>expand</em> it and
-        map it on its own — the list shows all ${rows.length} categories and only the
-        expanded one reveals its targets, so you never lose your place.
-      </p>
-      <div id="cm-acc" class="accordion"></div>
-    </div>
-
-    <div class="card" id="cm-table-card">
-      <div class="card-head"><h3>All categories at once</h3></div>
-      <div class="row">
-        <label class="check"><input type="checkbox" id="cm-showall">
-          Show all ${rows.length} rows (including confident matches)</label>
-        <input type="search" id="cm-search" placeholder="filter…" style="max-width:240px">
-      </div>
-      <div class="tbl-wrap" style="max-height:600px;overflow:auto">
-        <table id="cm-tbl">
-          <thead><tr>
-            <th style="width:19%">Dataset 1 (previous)</th>
-            <th style="width:36%">Dataset 2 (updated) — one or more targets</th>
-            <th style="width:13%">Analysis name</th>
-            <th>Status</th><th>Method</th><th>Evidence</th>
-          </tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <p class="hint" style="margin-top:8px">
-        Add a target to make one Dataset-1 category cover several Dataset-2 entries.
-        Give two rows the <em>same analysis name</em> to merge them into one reported
-        category. Set a row's status to <em>excluded</em> to leave it out entirely.
-        A row left <em>unmapped</em> is not analysed at all.
-      </p>
-    </div>
-
-    ${(cm.new_in_b || []).length ? `
-    <div class="card">
-      <div class="card-head"><h3>Present only in Dataset 2 (${cm.new_in_b.length})</h3></div>
-      <p class="hint">These have no counterpart in the previous dataset, so by
-         default they are listed here and left out of the analysis — a category with
-         no before-value cannot produce an impact figure. Attach one to a Dataset-1
-         category above to bring it in as part of that category.</p>
-      <div class="chips">
-        ${cm.new_in_b.slice(0, 200).map(u =>
-          `<span class="chip" data-newb="${esc(ukeyLabel(u))}">${esc(ukeyLabel(u))}</span>`).join('')}
-      </div>
-      ${cm.new_in_b.length > 200 ? `<p class="hint">…and ${cm.new_in_b.length - 200} more.</p>` : ''}
-      <label class="check" style="margin-top:10px">
-        <input type="checkbox" id="cm-inc-newb" ${S.catmapIncludeNewInB ? 'checked' : ''}>
-        Report them as new categories in their own right (they will show no
-        previous value)
-      </label>
-    </div>` : ''}`;
-
-  const tbody = $('#cm-tbl tbody');
-  const showAll = $('#cm-showall');
-  const search = $('#cm-search');
-
-  // restore whatever the user had set before this render
-  showAll.checked = !!S.catmapView.showAll;
-  search.value = S.catmapView.search || '';
-
-  showAll.onchange = () => { S.catmapView.showAll = showAll.checked; drawCatmapRows(); };
-  search.oninput = () => { S.catmapView.search = search.value; drawCatmapRows(); };
-
-  // Must not be a re-declared closure: drawCatmapRows() is called again after an
-  // edit, when this function body is not running.
-  drawCatmapRows();
-
-  // Accordion, one category at a time. The full table stays available behind the
-  // toggle, but 150-odd rows at once is not how anyone confirms a mapping.
-  const onlyOne = $('#cm-onlyone');
-  if (onlyOne) onlyOne.onchange = () => {
-    S.catmapOnlyOne = onlyOne.checked;
-    applyCatmapLayout();
-  };
-  const prev = $('#cm-prev'), next = $('#cm-next');
-  if (prev) prev.onclick = () => stepCatmapPick(-1);
-  if (next) next.onclick = () => stepCatmapPick(+1);
-  const openNext = $('#cm-open-next');
-  if (openNext) openNext.onclick = () => stepCatmapPick(+1);
-
-  const hideOk = $('#cm-hideok');
-  if (hideOk) hideOk.onchange = () => {
-    S.catmapAcc.hideOk = hideOk.checked;
-    drawCatmapAccordion();
-  };
-  const accSearch = $('#cm-acc-search');
-  if (accSearch) accSearch.oninput = () => {
-    S.catmapAcc.search = accSearch.value;
-    drawCatmapRowsAcc();
-  };
-
-  applyCatmapLayout();
-  drawCatmapAccordion();
-
-  const incNewB = $('#cm-inc-newb');
-  if (incNewB) incNewB.onchange = () => {
-    S.catmapIncludeNewInB = incNewB.checked;
-  };
-
-  $('#cm-reprobe')?.addEventListener('click', () => doCategoryMapping($('#cm-metric').value));
-}
-
-/** Show the accordion or the full table, according to the toggle. */
-function applyCatmapLayout() {
-  const card = $('#cm-table-card');
-  if (card) card.style.display = S.catmapOnlyOne ? 'none' : '';
-  const tgl = $('#cm-onlyone');
-  if (tgl) tgl.checked = !!S.catmapOnlyOne;
-}
-
-/**
- * Move the open accordion row to the next/previous row that still needs a call.
- *
- * When every category is already accepted there is nowhere to step to, so the
- * buttons stay put rather than silently jumping. Use the filter or "Hide
- * confident matches" to work through the ones that do need review.
- */
-function stepCatmapPick(dir) {
-  const rows = S.catmap?.rows || [];
-  if (!rows.length) return;
-  const openable = rows.map((_, i) => i)
-    .filter(i => !S.catmapAcc.hideOk || !isResolved(i));
-  const pool = openable.length ? openable : rows.map((_, i) => i);
-  const cur = S.catmapPick;
-  if (dir > 0) {
-    // Prefer the next row that still needs review; fall back to the next row.
-    const pending = pool.filter(i => !isResolved(i));
-    let nxt = null;
-    if (pending.length) {
-      const afterCur = pending.filter(i => cur === null || i > cur);
-      nxt = afterCur.length ? afterCur[0] : pending[0];
-    } else {
-      const afterCur = pool.filter(i => cur === null || i > cur);
-      nxt = afterCur.length ? afterCur[0] : pool[0];
-    }
-    S.catmapPick = nxt;
-  } else {
-    const before = pool.filter(i => cur !== null && i < cur);
-    S.catmapPick = before.length ? before[before.length - 1] : pool[pool.length - 1];
-  }
-  drawCatmapAccordion();
-  const el = $(`#cm-acc-item-${S.catmapPick}`);
-  if (el) el.scrollIntoView({ block: 'nearest' });
-}
-
-/** Toggle a row open/closed in the accordion. Only one is ever open. */
-function toggleCatmapPick(idx) {
-  S.catmapPick = (S.catmapPick === idx) ? null : idx;
-  drawCatmapAccordion();
-}
-
-/**
- * The one-category-at-a-time editor, as an accordion.
- *
- * Every Dataset-1 category is a row. Clicking the arrow (or the row header)
- * expands exactly that row and collapses the others, so the user maps one
- * category at a time without the list disappearing underneath them. The body of
- * an expanded row is built once and only rebuilt when the row it belongs to
- * actually changes, so a half-typed analysis name or a target dropdown survives.
- */
-function drawCatmapAccordion() {
-  const box = $('#cm-acc');
-  if (!box) return;
-  const cm = S.catmap;
-  const rows = cm?.rows || [];
-  if (!rows.length) {
-    box.innerHTML = '<p class="hint">No categories to map.</p>';
-    return;
-  }
-  if (S.catmapPick !== null && (S.catmapPick < 0 || S.catmapPick >= rows.length)) {
-    S.catmapPick = null;
-  }
-  // Arriving at the step leaves every row collapsed, which shows headers but no
-  // controls and leaves Previous / Next with nothing to move from. Open the
-  // first row that still needs a decision so the section demonstrates itself.
-  // Done once (S.catmapOpened), so a deliberate collapse stays collapsed when
-  // the user comes back to this panel.
-  if (S.catmapPick === null && !S.catmapOpened && rows.length) {
-    const first = rows.findIndex((_, i) => !isResolved(i));
-    S.catmapPick = first >= 0 ? first : 0;
-    S.catmapOpened = true;
-  }
-  const pending = rows.filter((_, i) => !isResolved(i)).length;
-
-  // Build the shell once; only the header list is repainted from here.
-  if (!$('#cm-acc-list')) {
-    box.innerHTML = `
-      <div class="acc-sum">
-        <span><b>${rows.length}</b> categories</span>
-        <span class="${pending ? 'neg' : ''}"><b>${pending}</b> still to review</span>
-        <span><b>${rows.length - pending}</b> confident</span>
-      </div>
-      <div id="cm-acc-list"></div>`;
-  }
-  drawCatmapRowsAcc();
-}
-
-/**
- * Repaint the accordion rows. Only the header of each row is regenerated; the
- * body of the open row is built (or left) separately, which is what preserves
- * focus and typed input while a target is being edited.
- */
-function drawCatmapRowsAcc() {
-  const box = $('#cm-acc-list');
-  if (!box) return;
-  const cm = S.catmap;
-  const rows = cm?.rows || [];
-  const q = (S.catmapAcc.search || '').toLowerCase();
-  const hideOk = !!S.catmapAcc.hideOk;
-  const [scale, unit] = scaleOf(...rows.map(r => r.a_total).filter(v => v),
-                               ...rows.map(r => r.b_total).filter(v => v));
-
-  const openIdx = S.catmapPick;
-  const openEl = openIdx !== null ? $(`#cm-acc-item-${openIdx}`) : null;
-  // If a row is open and its shell is still on screen, patch it in place and
-  // leave its body alone — rebuilding it would destroy the control in use.
-  if (openEl && openEl.parentElement === box && !openEl.dataset.needsRebuild) {
-    const head = openEl.querySelector('.acc-head');
-    const r = catmapRow(openIdx);
-    if (head) head.outerHTML = accHeadHtml(openIdx, r, scale, unit, true);
-    bindAccHeads(box);
-    // A status change from elsewhere can flip "needs review", so refresh the
-    // count tile without touching the bodies.
-    const sum = $('#cm-acc > .acc-sum');
-    if (sum) {
-      const p = rows.filter((_, i) => !isResolved(i)).length;
-      sum.innerHTML = `<span><b>${rows.length}</b> categories</span>
-        <span class="${p ? 'neg' : ''}"><b>${p}</b> still to review</span>
-        <span><b>${rows.length - p}</b> confident</span>`;
-    }
-    return;
-  }
-
-  const visible = [];
-  rows.forEach((_, i) => {
-    const st = catmapRow(i);
-    if (hideOk && st.status === 'mapped') return;
-    if (q && !(`${st.source} ${st.source_sub || ''} ${st.canonical} `
-      + `${st.targets.map(t => t.category + ' ' + (t.subcategory || '')).join(' ')}`)
-      .toLowerCase().includes(q)) return;
-    visible.push(i);
-  });
-
-  if (!visible.length) {
-    box.innerHTML = `<p class="hint" style="padding:10px">${
-      q ? 'No category matches the filter.' : 'Nothing to show — every category is a confident match.'}</p>`;
-    return;
-  }
-
-  box.innerHTML = visible.map(i => {
-    const st = catmapRow(i);
-    const open = i === openIdx;
-    return `<div class="acc-item ${open ? 'open' : ''}" id="cm-acc-item-${i}">
-      ${accHeadHtml(i, st, scale, unit, open)}
-      ${open ? `<div class="acc-body" id="cm-acc-body-${i}">${accBodyHtml(i, st, scale, unit)}</div>` : ''}
-    </div>`;
-  }).join('');
-
-  bindAccHeads(box);
-
-  // Bind the body of the open row, if one is rendered.
-  if (openIdx !== null && visible.includes(openIdx)) {
-    bindAccBody(openIdx, catmapRow(openIdx));
-  }
-}
-
-/** The clickable header of an accordion row: arrow, name, values, status flag. */
-function accHeadHtml(idx, st, scale, unit, open) {
-  // A row's flag now says what the *user* has done with it, not what the app
-  // thinks of it. "not mapped" is "you have not decided"; "excluded" is a
-  // deliberate call.
-  const flag = st.status === 'mapped' ? { c: 'ok', t: 'mapped' }
-    : st.status === 'excluded' ? { c: 'muted', t: 'excluded' }
-      : { c: 'warn', t: 'not mapped' };
-  const nt = st.targets.length;
-  return `<button type="button" class="acc-head" data-acc="${idx}"
-      aria-expanded="${open ? 'true' : 'false'}">
-    <span class="acc-arrow">${open ? '▾' : '▸'}</span>
-    <span class="acc-name">${esc(st.source)}${st.source_sub
-      ? ` <span class="hint">/ ${esc(st.source_sub)}</span>` : ''}</span>
-    <span class="acc-equiv">${nt
-      ? `→ ${nt} entr${nt === 1 ? 'y' : 'ies'}${st.canonical && st.canonical !== st.source
-          ? ` · reported as <em>${esc(st.canonical)}</em>` : ''}`
-      : '<em>nothing attached</em>'}</span>
-    <span class="acc-vals">${st.a_total != null ? `A ${fmtVal(st.a_total, scale, unit)}` : ''}${st.b_total != null
-      ? ` · B ${fmtVal(st.b_total, scale, unit)}` : ''}</span>
-    <span class="tag ${flag.c}">${flag.t}</span>
-  </button>`;
-}
-
-/**
- * The evidence panel: the closest name and the closest value, side by side.
- *
- * Both are observations, not decisions. Each carries a button that applies it,
- * because making the user retype a name the app already found would be silly —
- * but the button is the only path from a hint into the mapping, so nothing is
- * ever applied on the user's behalf.
- */
-function hintHtml(r) {
-  const h = r.hint || {};
-  const bits = [];
-  if (h.closest_name) {
-    const n = h.closest_name;
-    bits.push(`<div class="hint-line">
-      <span class="hint">Closest name in the updated dataset:</span>
-      <strong>${esc(n.label || n.category)}</strong>
-      <span class="hint">(${fmtNum(n.similarity_pct, 0)}% alike)</span>
-      <button class="btn small ghost" data-cm-hint="name"
-              data-cm-hint-cat="${esc(n.category)}"
-              data-cm-hint-sub="${esc(n.subcategory || '')}">use this</button>
-    </div>`);
-  }
-  if (h.closest_value) {
-    const v = h.closest_value;
-    const d = v.delta_pct;
-    bits.push(`<div class="hint-line">
-      <span class="hint">Closest value:</span>
-      <strong>${esc(v.label || v.category)}</strong>
-      <span class="hint ${d == null ? '' : (d < 0 ? 'neg' : '')}">(${d == null ? 'n/a' : (d > 0 ? '+' : '') + fmtNum(d, 1) + '%'})</span>
-      <button class="btn small ghost" data-cm-hint="value"
-              data-cm-hint-cat="${esc(v.category)}"
-              data-cm-hint-sub="${esc(v.subcategory || '')}">use this</button>
-    </div>`);
-  }
-  if (!bits.length) {
-    return `<div class="hint" style="margin:0 0 6px">
-      No close name or value in the other dataset — this category may have no
-      counterpart there.</div>`;
-  }
-  return `<div class="cm-hints" style="margin:0 0 6px">
-    ${bits.join('')}
-    <div class="hint" style="font-size:11px;margin-top:2px">
-      These are hints only. A close value is not proof of equivalence — the two
-      datasets differ precisely because values moved.
-    </div>
-  </div>`;
-}
-
-function bindHintButtons(idx, r) {
-  $$('#cm-acc-body-' + idx + ' [data-cm-hint]').forEach(btn => {
-    btn.onclick = () => {
-      const cat = btn.dataset.cmHintCat, sub = btn.dataset.cmHintSub || '';
-      const targets = r.targets.map(t => ({ ...t }));
-      if (targets.some(t => t.category === cat && (t.subcategory || '') === sub)) return;
-      targets.push({ category: cat, subcategory: sub, total: null });
-      cmSet(idx, { targets, status: 'mapped' });
-      redrawOpenAccBody(idx);
-      drawCatmapRows();
-    };
-  });
-}
-
-function bindAccHeads(root) {
-  $$('.acc-head', root).forEach(btn => {
-    btn.onclick = () => toggleCatmapPick(Number(btn.dataset.acc));
-  });
-}
-
-/** The body of an expanded row: value, analysis name, targets, status, notes. */
-function accBodyHtml(idx, r, scale, unit) {
-  const base = S.catmap.rows[idx];
-  const num = (v) => (v === null || v === undefined)
-    ? '—' : fmtNum(v / scale, 2) + (unit ? ' ' + unit : '');
-  return `
-    <div class="acc-body-grid">
-      <div class="field" style="margin:0">
-        <label>Reported as <span class="hint">(same name merges two categories)</span></label>
-        <input id="cm-canon" value="${esc(r.canonical)}" style="width:100%"
-               placeholder="the analysis name for this category">
-      </div>
-      <div class="field" style="margin:0;max-width:170px">
-        <label>Status</label>
-        <select id="cm-status">
-          ${['unmapped', 'mapped', 'excluded'].map(v =>
-            `<option value="${v}" ${r.status === v ? 'selected' : ''}>${v}</option>`).join('')}
-        </select>
-      </div>
-      <div class="acc-vals-box">
-        <div class="hint">Previous value</div>
-        <div class="num">${num(r.a_total)}</div>
-        <div class="hint" style="margin-top:6px">Updated value</div>
-        <div class="num">${num(r.b_total)}</div>
-      </div>
-    </div>
-
-    <div class="hint" style="margin:8px 0 4px">
-      ${r.targets.length
-        ? `You have attached ${r.targets.length} entr${r.targets.length === 1 ? 'y' : 'ies'}
-           in the updated dataset.`
-        : `Nothing in the updated dataset is attached yet.`}
-      ${base.method ? ` <em>(${esc(base.method)})</em>` : ''}
-    </div>
-    ${hintHtml(r)}
-    <div id="cm-targets"></div>
-    <div class="row" style="margin-top:8px;align-items:flex-end">
-      <div class="field" style="margin:0;min-width:190px;flex:1">
-        <label>Add another target for this category</label>
-        <select id="cm-add-cat"><option value="">— choose a category —</option>
-          ${(S._cmBCats || []).map(c => `<option>${esc(c)}</option>`).join('')}</select>
-      </div>
-      <div class="field" style="margin:0;min-width:150px">
-        <label>Subcategory</label>
-        <select id="cm-add-sub"><option value="">(whole category)</option></select>
-      </div>
-      <button class="btn small" id="cm-add">+ Add target</button>
-    </div>
-    ${r.note ? `<p class="hint" style="margin-top:8px">${esc(r.note)}</p>` : ''}`;
-}
-
-/** Wire the controls inside one expanded row. */
-function bindAccBody(idx, r) {
-  drawCatmapTargets(idx, r);
-  bindHintButtons(idx, r);
-
-  const statusSel = $('#cm-status');
-  if (statusSel) statusSel.onchange = (e) => {
-    cmSet(idx, { status: e.target.value });
-    // A status change alters the flag in the header and the pending count, but
-    // not which rows are listed - so repaint headers only, keeping this body.
-    drawCatmapRowsAcc();
-    drawCatmapRows();
-  };
-  const canon = $('#cm-canon');
-  if (canon) canon.oninput = (e) => cmSet(idx, { canonical: e.target.value });
-
-  const addCat = $('#cm-add-cat'), addSub = $('#cm-add-sub');
-  if (addCat) addCat.onchange = () => {
-    const subs = (S._cmSubsFor || (() => []))(addCat.value);
-    const list = subs.length ? subs : (S._cmAllSubs || []);
-    addSub.innerHTML = '<option value="">(whole category)</option>'
-      + list.map(x => `<option>${esc(x)}</option>`).join('');
-  };
-  const addBtn = $('#cm-add');
-  if (addBtn) addBtn.onclick = () => {
-    if (!addCat.value) return;
-    const targets = r.targets.map(t => ({ ...t }));
-    const sub = addSub.value || '';
-    if (targets.some(t => t.category === addCat.value && (t.subcategory || '') === sub)) return;
-    targets.push({ category: addCat.value, subcategory: sub, total: null });
-    cmSet(idx, { targets, status: r.status === 'unmapped' ? 'mapped' : r.status });
-    // The body genuinely changed (a new target was added), so rebuild just this
-    // row's body - the headers and every other row are left alone.
-    redrawOpenAccBody(idx);
-    drawCatmapRows();
-  };
-}
-
-/**
- * Rebuild the body of the currently-open accordion row and rebind it, without
- * repainting the header list. Used when the row's own content changes.
- */
-function redrawOpenAccBody(idx) {
-  const item = $(`#cm-acc-item-${idx}`);
-  if (!item) { drawCatmapAccordion(); return; }
-  const st = catmapRow(idx);
-  const head = item.querySelector('.acc-head');
-  const [scale, unit] = scaleOf(st.a_total, st.b_total);
-  if (head) head.outerHTML = accHeadHtml(idx, st, scale, unit, true);
-  let body = item.querySelector('.acc-body');
-  const html = accBodyHtml(idx, st, scale, unit);
-  if (body) body.innerHTML = html;
-  else {
-    const div = document.createElement('div');
-    div.className = 'acc-body';
-    div.id = `cm-acc-body-${idx}`;
-    div.innerHTML = html;
-    item.appendChild(div);
-  }
-  bindAccHeads(item);
-  bindAccBody(idx, st);
-}
-
-/** The target list inside the expanded editor, each with a remove control. */
-function drawCatmapTargets(idx, r) {
-  const box = $('#cm-targets');
-  if (!box) return;
-  if (!r.targets.length) {
-    box.innerHTML = `<div class="notice warn" style="margin:0">
-      Nothing in the updated dataset is attached to this category yet. Add a target
-      to map it, or set the status to <em>excluded</em> to leave it out.</div>`;
-    return;
-  }
-  const [scale, unit] = scaleOf(...r.targets.map(t => t.total).filter(v => v));
-  box.innerHTML = r.targets.map((t, i) => `
-    <div class="row" style="align-items:center;gap:8px;padding:4px 0">
-      <span class="chip">${esc(t.category)}${t.subcategory ? ' / ' + esc(t.subcategory) : ''}</span>
-      <span class="hint">${t.total === null || t.total === undefined
-        ? '' : fmtNum(t.total / scale, 2) + (unit ? ' ' + unit : '')}</span>
-      <button class="btn small ghost" data-rm="${i}">×</button>
-    </div>`).join('');
-  box.querySelectorAll('[data-rm]').forEach(btn => {
-    btn.onclick = () => {
-      const targets = r.targets.map(t => ({ ...t }));
-      targets.splice(Number(btn.dataset.rm), 1);
-      cmSet(idx, { targets });
-      // Removing a target changes only this row's body, so rebuild just that
-      // row rather than the whole accordion (which would close it on the user).
-      redrawOpenAccBody(idx);
-      drawCatmapRows();
-    };
-  });
-}
-
-/** Redraw only the category-mapping table body, leaving the controls alone. */
-function drawCatmapRows() {
-  const cm = S.catmap;
-  if (!cm || !$('#cm-tbl')) return;
-  const tbody = $('#cm-tbl tbody');
-  const showAll = $('#cm-showall');
-  const search = $('#cm-search');
-  const rows = cm.rows;
-  const bCats = S._cmBCats || [];
-  const subsFor = S._cmSubsFor || (() => []);
-  const allSubs = S._cmAllSubs || [];
-  const [scale, unit] = scaleOf(...rows.map(r => r.a_total).filter(v => v),
-                               ...rows.map(r => r.b_total).filter(v => v));
-
-  function targetEditor(idx, targets) {
-    const rowsHtml = targets.map((t, ti) => {
-      const subs = subsFor(t.category);
-      const opts = subs.length ? subs : allSubs;
-      return `<div class="target-row">
-        <select data-cm-cat="${idx}" data-cm-t="${ti}">
-          <option value="">— pick a category —</option>
-          ${bCats.map(c => `<option ${t.category === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}
-        </select>
-        <select data-cm-sub="${idx}" data-cm-t="${ti}">
-          <option value="">(whole category)</option>
-          ${opts.map(x => `<option ${t.subcategory === x ? 'selected' : ''}>${esc(x)}</option>`).join('')}
-        </select>
-        <button class="btn small" data-cm-del="${idx}" data-cm-t="${ti}" title="Remove">×</button>
-      </div>`;
-    }).join('');
-    return `<div class="targets">${rowsHtml}
-      <button class="btn small" data-cm-add="${idx}">+ add target</button></div>`;
-  }
-
-  function draw() {
-    const q = (search.value || '').toLowerCase();
-    const list = [];
-    rows.forEach((r, i) => {
-      const st = catmapRow(i);
-      if (!showAll.checked && st.status === 'mapped') return;
-      if (q && !(`${st.source} ${st.canonical} ${st.targets.map(t => t.category + ' ' + t.subcategory).join(' ')}`
-        .toLowerCase().includes(q))) return;
-      list.push([i, st]);
-    });
-    if (!list.length) {
-      tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:22px">
-        ${showAll.checked ? 'No rows match the filter.'
-          : 'Every category has been dealt with. Tick “Show all” to review them.'}
-      </td></tr>`;
-      return;
-    }
-    tbody.innerHTML = list.map(([i, st]) => {
-      // The evidence column shows what can be compared, labelled as a hint.
-      const ev = [];
-      const h = st.hint || {};
-      if (h.closest_name) ev.push(`~${h.closest_name.label} (${fmtNum(h.closest_name.similarity_pct, 0)}%)`);
-      if (h.closest_value) ev.push(`value Δ ${fmtNum(h.closest_value.delta_pct, 1)}%`);
-      return `<tr>
-        <td>${esc(st.source)}${st.source_sub ? ` <span class="hint">/ ${esc(st.source_sub)}</span>` : ''}
-          ${st.a_total != null ? `<div class="hint">${fmtVal(st.a_total, scale, unit)}</div>` : ''}</td>
-        <td style="text-align:left">${targetEditor(i, st.targets)}</td>
-        <td style="text-align:left">
-          <input type="text" data-cm-canonical="${i}" value="${esc(st.canonical)}" style="min-width:130px">
-        </td>
-        <td style="text-align:left">
-          <select data-cm-status="${i}">
-            ${['unmapped', 'mapped', 'excluded']
-              .map(x => `<option ${st.status === x ? 'selected' : ''}>${x}</option>`).join('')}
-          </select>
-        </td>
-        <td style="text-align:left;color:var(--muted)">${esc(st.method || '')}</td>
-        <td style="text-align:left;color:var(--muted);font-size:11px;max-width:260px">
-          ${esc(ev.join(' · ') || st.note || '')}
-          ${st.b_total != null ? `<div>B total ${fmtVal(st.b_total, scale, unit)}</div>` : ''}
-        </td>
-      </tr>`;
-    }).join('') + (list.length > 600
-      ? `<tr><td colspan="6" style="color:var(--muted);padding:12px">Showing first 600 of ${list.length} — use the filter to narrow.</td></tr>`
-      : '');
-  }
-
-  draw();
-}
-
+/** The human label for a unit. */
 function ukeyLabel(u) {
   return u.subcategory ? `${u.category} / ${u.subcategory}` : String(u.category);
 }
 
-document.addEventListener('change', e => {
-  const cat = e.target.closest('[data-cm-cat]');
-  if (cat) {
-    const i = Number(cat.dataset.cmCat), t = Number(cat.dataset.cmT);
-    const st = catmapRow(i);
-    const targets = st.targets.map(x => ({ ...x }));
-    targets[t] = { ...targets[t], category: cat.value, subcategory: '' };
-    cmSet(i, { targets });
-    // Changing a target does not change WHICH rows are listed - a row's status
-    // and canonical name are untouched. Redrawing the table here would close the
-    // dropdown the user is still using, scroll to the top and drop focus, which
-    // is exactly the "collapsing" that was reported. The only thing that needs
-    // refreshing is the subcategory options for this one row.
-    refreshTargetSubs(cat);
-    return;
-  }
-  const sub = e.target.closest('[data-cm-sub]');
-  if (sub) {
-    const i = Number(sub.dataset.cmSub), t = Number(sub.dataset.cmT);
-    const st = catmapRow(i);
-    const targets = st.targets.map(x => ({ ...x }));
-    targets[t] = { ...targets[t], subcategory: sub.value };
-    cmSet(i, { targets });
-    return;
-  }
-  const stat = e.target.closest('[data-cm-status]');
-  if (stat) {
-    // Status drives the "needs review" filter, so the listed rows genuinely can
-    // change here. Redraw the body but keep the controls and scroll position.
-    const wrap = $('.tbl-wrap');
-    const keepTop = wrap ? wrap.scrollTop : 0;
-    cmSet(Number(stat.dataset.cmStatus), { status: stat.value });
-    drawCatmapRows();
-    if (wrap) wrap.scrollTop = keepTop;
-    return;
-  }
-  const can = e.target.closest('[data-cm-canonical]');
-  if (can) { cmSet(Number(can.dataset.cmCanonical), { canonical: can.value }); return; }
-});
-
-/** Repoint one row's subcategory dropdown at the newly-chosen category. */
-function refreshTargetSubs(catSelect) {
-  const row = catSelect.closest('.target-row');
-  const subSel = row && row.querySelector('[data-cm-sub]');
-  if (!subSel) return;
-  const subs = (S._cmSubsFor || (() => []))(catSelect.value);
-  const opts = subs.length ? subs : (S._cmAllSubs || []);
-  const current = subSel.value;
-  subSel.innerHTML = '<option value="">(whole category)</option>'
-    + opts.map(x => `<option ${x === current ? 'selected' : ''}>${esc(x)}</option>`).join('');
-  subSel.value = opts.includes(current) ? current : '';
+/** The reported name for a unit, when the user leaves the field blank. */
+function label(cat, sub) {
+  return sub ? `${cat} / ${sub}` : String(cat || '');
 }
 
-document.addEventListener('click', e => {
-  const add = e.target.closest('[data-cm-add]');
-  if (add) {
-    const i = Number(add.dataset.cmAdd);
-    const st = catmapRow(i);
-    cmSet(i, { targets: [...st.targets, { category: '', subcategory: '' }] });
-    renderCatmap();
+/** Dataset-1 categories no mapping covers. They produce no impact figure. */
+function unresolvedCategories() {
+  const covered = new Set(catmapList().map(m => m.source_key));
+  return (S.catmap?.a_units || [])
+    .filter(u => !covered.has(akey(u)))
+    .map(ukeyLabel)
+    .sort();
+}
+
+function renderCatmap() {
+  const box = $('#catmap-out');
+  if (!box) return;
+  const maps = catmapList();
+  const aUnits = (S.catmap?.a_units || []).slice().sort(
+    (x, y) => ukeyLabel(x).localeCompare(ukeyLabel(y)));
+  const bUnits = (S.catmap?.b_units || []).slice().sort(
+    (x, y) => ukeyLabel(x).localeCompare(ukeyLabel(y)));
+  S._cmAUnits = aUnits;
+  S._cmBUnits = bUnits;
+  S._cmACats = Array.from(new Set(aUnits.map(u => u.category))).sort();
+  S._cmBCats = Array.from(new Set(bUnits.map(u => u.category))).sort();
+  S._cmASubsFor = (cat) => Array.from(new Set(
+    aUnits.filter(u => u.category === cat && u.subcategory)
+      .map(u => u.subcategory))).sort();
+  S._cmSubsFor = (cat) => Array.from(new Set(
+    bUnits.filter(u => u.category === cat && u.subcategory)
+      .map(u => u.subcategory))).sort();
+
+  // The editor is the point of the step, so it is the only thing on screen
+  // until the user clicks Done or Cancel.
+  if (S.catmapDraft) { box.innerHTML = draftHtml(); bindDraft(); return; }
+
+  const uncovered = unresolvedCategories();
+  box.innerHTML = `
+    <div class="card">
+      <div class="card-head">
+        <h3>Category mappings (${maps.length})</h3>
+        <span class="sub">each mapping pairs a Dataset 1 category with a Dataset 2 category</span>
+      </div>
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn primary" id="cm-add-map">+ Mapping</button>
+        <span class="spacer"></span>
+        ${maps.length
+          ? `<span class="hint">${maps.length} mapping${maps.length === 1 ? '' : 's'} defined
+             · ${uncovered.length} of ${aUnits.length} Dataset 1 categories not mapped</span>`
+          : `<span class="hint">No mappings yet — click “+ Mapping” to define one.</span>`}
+      </div>
+      ${maps.length
+        ? `<div class="cm-map-list">${maps.map(mapCardHtml).join('')}</div>
+           ${uncovered.length ? `<p class="hint" style="margin:12px 0 0">
+             Not mapped, so not analysed: ${uncovered.slice(0, 8).map(esc).join(', ')}${uncovered.length > 8 ? ` and ${uncovered.length - 8} more` : ''}.
+             A category with no counterpart has no before-value to compare against.</p>` : ''}`
+        : `<p class="hint" style="margin:0">
+             A Dataset 1 category with no mapping has no counterpart to compare
+             against, so it produces no impact figure and is left out.</p>`}
+    </div>`;
+
+  const add = $('#cm-add-map');
+  if (add) add.onclick = () => openDraft(null);
+}
+
+/** One saved mapping: what it maps, and what it is reported as. */
+function mapCardHtml(m, i) {
+  const src = m.source_sub
+    ? `${esc(m.source)} <span class="hint">/ ${esc(m.source_sub)}</span>`
+    : esc(m.source);
+  const dst = m.targets.map(t => t.subcategory
+    ? `${esc(t.category)} <span class="hint">/ ${esc(t.subcategory)}</span>`
+    : esc(t.category)).join(' <span class="hint">+</span> ');
+  // Only show the reported name when it adds information - otherwise the card
+  // repeats the Dataset 1 name three times.
+  const derived = label(m.source, m.source_sub || '');
+  return `
+    <div class="cm-map">
+      <div class="cm-map-side">
+        <div class="hint">Dataset 1</div>
+        <div class="cm-map-cat">${src}</div>
+      </div>
+      <div class="cm-map-arrow">→</div>
+      <div class="cm-map-side">
+        <div class="hint">Dataset 2</div>
+        <div class="cm-map-cat">${dst}</div>
+      </div>
+      ${m.canonical !== derived ? `
+      <div class="cm-map-side">
+        <div class="hint">Reported as</div>
+        <div class="cm-map-cat">${esc(m.canonical)}</div>
+      </div>` : ''}
+      <div class="cm-map-acts">
+        <button class="btn small" data-cm-edit="${i}">Edit</button>
+        <button class="btn small ghost" data-cm-remove="${i}" title="Remove">×</button>
+      </div>
+    </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// the editor
+// ---------------------------------------------------------------------------
+
+/**
+ * Start a new mapping, or edit an existing one.
+ *
+ * `index === null` means new. The draft is a deep copy so Cancel genuinely
+ * discards - an aliased object would let Cancel keep every edit.
+ */
+function openDraft(index = null) {
+  const existing = index === null ? null : catmapList()[index];
+  const draft = existing
+    ? JSON.parse(JSON.stringify(existing))
+    : { source: '', source_sub: '', canonical: '', targets: [] };
+  draft._index = index;
+  if (!draft.targets.length) draft.targets = [{ category: '', subcategory: '' }];
+  S.catmapDraft = draft;
+  renderCatmap();
+}
+
+/** Save the draft into the list. This is what "Done" does. */
+function commitDraft() {
+  const d = S.catmapDraft;
+  if (!d) return;
+  if (!d.source) { alert('Choose the Dataset 1 category first.'); return; }
+  const targets = d.targets.filter(t => t.category);
+  if (!targets.length) {
+    alert('Choose at least one Dataset 2 category to map it to.');
     return;
   }
-  const del = e.target.closest('[data-cm-del]');
-  if (del) {
-    const i = Number(del.dataset.cmDel), t = Number(del.dataset.cmT);
-    const st = catmapRow(i);
-    cmSet(i, { targets: st.targets.filter((_, j) => j !== t) });
-    renderCatmap();
+  const entry = {
+    source: d.source,
+    source_sub: d.source_sub || '',
+    source_key: ukey(d.source, d.source_sub || ''),
+    // Blank means "report it under the name it already has".
+    canonical: (d.canonical || '').trim() || label(d.source, d.source_sub),
+    targets: targets.map(t => ({
+      category: t.category,
+      subcategory: t.subcategory || '',
+    })),
+    status: 'mapped',
+  };
+  S.catmapMaps = S.catmapMaps || [];
+  if (d._index === null) {
+    // A duplicate would produce two rows fighting over the same Dataset 1 unit.
+    const dup = S.catmapMaps.findIndex(m => m.source_key === entry.source_key);
+    if (dup >= 0) S.catmapMaps[dup] = entry;
+    else S.catmapMaps.push(entry);
+  } else {
+    S.catmapMaps[d._index] = entry;
   }
-});
+  S.catmapDraft = null;
+  S.catmapTouched = true;
+  renderCatmap();
+}
 
-function buildCategoryMapping() {
-  const rows = S.catmap.rows.map((_, i) => {
-    const st = catmapRow(i);
-    // A row the user never touched stays `unmapped` and carries no targets, so
-    // the analysis drops it. A row with a target is `mapped`; a row with a
-    // status set but no target is respected as the user left it.
-    const targets = st.targets.filter(t => t.category);
-    return {
-      source: st.source,
-      source_sub: st.source_sub,
-      canonical: st.canonical,
-      targets,
-      status: st.status,
+function removeMap(index) {
+  S.catmapMaps.splice(index, 1);
+  S.catmapTouched = true;
+  renderCatmap();
+}
+
+function draftHtml() {
+  const d = S.catmapDraft;
+  const aCats = S._cmACats || [];
+  const aSubs = d.source ? (S._cmASubsFor || (() => []))(d.source) : [];
+  // A mapping may be a bare category OR a category + subcategory, and the
+  // combination is allowed on *either* side. So the picker is offered whenever
+  // the wired structure can express a subcategory at all - a subcategory column
+  // is wired on this side, or the picked category has subcategory units. With
+  // neither, the only honest option is the whole category, and the select still
+  // renders (with just that one option) so both sides look the same.
+  const showSub = !!(S.dimCols.a.subcategory || S.catmap?.has_subcategory_a
+                     || aSubs.length > 0);
+  const derived = d.source ? label(d.source, d.source_sub) : '';
+  return `
+    <div class="card cm-draft">
+      <div class="card-head">
+        <h3>${d._index === null ? 'New mapping' : 'Edit mapping'}</h3>
+        <span class="sub">pick a Dataset 1 category (optionally + subcategory), then the Dataset 2 entries it corresponds to</span>
+      </div>
+
+      <div class="cm-draft-grid">
+        <div class="cm-draft-col">
+          <h4>Dataset 1</h4>
+          <div class="field">
+            <label>Category</label>
+            <select id="cm-draft-a-cat">
+              <option value="">— pick a category —</option>
+              ${aCats.map(c => `<option ${d.source === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}
+            </select>
+          </div>
+          ${showSub ? `
+          <div class="field">
+            <label>Subcategory <span class="hint">(optional)</span></label>
+            <select id="cm-draft-a-sub" ${d.source ? '' : 'disabled'}>
+              <option value="">(whole category)</option>
+              ${aSubs.map(s => `<option ${d.source_sub === s ? 'selected' : ''}>${esc(s)}</option>`).join('')}
+            </select>
+          </div>` : ''}
+        </div>
+
+        <div class="cm-draft-col">
+          <h4>Dataset 2 <span class="hint">— one or more</span></h4>
+          <div id="cm-draft-targets">
+            ${d.targets.map(targetRowHtml).join('')}
+          </div>
+          <button class="btn small" id="cm-draft-add">+ add another Dataset 2 entry</button>
+        </div>
+      </div>
+
+      <div class="field" style="margin-top:14px;max-width:440px">
+        <label>Reported as <span class="hint">(optional — blank uses the Dataset 1 name)</span></label>
+        <input id="cm-draft-name" value="${esc(d.canonical || '')}"
+               placeholder="${esc(derived || 'the analysis name')}">
+      </div>
+
+      <div class="row" style="margin-top:16px">
+        <button class="btn primary" id="cm-draft-done">Done</button>
+        <button class="btn ghost" id="cm-draft-cancel">Cancel</button>
+      </div>
+    </div>`;
+}
+
+function targetRowHtml(t, ti) {
+  const bCats = S._cmBCats || [];
+  const subs = t.category ? (S._cmSubsFor || (() => []))(t.category) : [];
+  const many = (S.catmapDraft?.targets || []).length > 1;
+  // Symmetric with the Dataset 1 picker: a Dataset 2 target may be a bare
+  // category or a category + subcategory, so the sub select is shown whenever
+  // that side can express a subcategory at all. `(whole category)` is always the
+  // default, so a bare target is still one click away.
+  const showSub = !!(S.dimCols.b.subcategory || S.catmap?.has_subcategory_b
+                     || subs.length > 0);
+  return `
+    <div class="cm-draft-target">
+      <select data-draft-cat="${ti}">
+        <option value="">— pick a category —</option>
+        ${bCats.map(c => `<option ${t.category === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}
+      </select>
+      ${showSub ? `
+        <select data-draft-sub="${ti}" ${t.category ? '' : 'disabled'}>
+          <option value="">(whole category)</option>
+          ${subs.map(s => `<option ${t.subcategory === s ? 'selected' : ''}>${esc(s)}</option>`).join('')}
+        </select>` : ''}
+      ${many ? `<button class="btn small ghost" data-draft-del="${ti}" title="Remove">×</button>` : ''}
+    </div>`;
+}
+
+function bindDraft() {
+  const d = S.catmapDraft;
+  if (!d) return;
+  const aCat = $('#cm-draft-a-cat');
+  if (aCat) aCat.onchange = () => {
+    d.source = aCat.value;
+    d.source_sub = '';
+    renderCatmap();   // repaint so the subcategory list matches the category
+  };
+  const aSub = $('#cm-draft-a-sub');
+  if (aSub) aSub.onchange = () => { d.source_sub = aSub.value; };
+  const name = $('#cm-draft-name');
+  if (name) name.oninput = () => { d.canonical = name.value; };
+
+  const add = $('#cm-draft-add');
+  if (add) add.onclick = () => {
+    d.targets.push({ category: '', subcategory: '' });
+    renderCatmap();
+  };
+  // Rebound after every repaint, because a category change re-renders the row
+  // (the subcategory list depends on it) and takes the old nodes with it.
+  $$('#cm-draft-targets [data-draft-cat]').forEach(sel => {
+    sel.onchange = () => {
+      const ti = Number(sel.dataset.draftCat);
+      d.targets[ti] = { category: sel.value, subcategory: '' };
+      renderCatmap();
     };
   });
+  $$('#cm-draft-targets [data-draft-sub]').forEach(sel => {
+    sel.onchange = () => {
+      d.targets[Number(sel.dataset.draftSub)].subcategory = sel.value;
+    };
+  });
+  $$('#cm-draft-targets [data-draft-del]').forEach(btn => {
+    btn.onclick = () => {
+      d.targets.splice(Number(btn.dataset.draftDel), 1);
+      if (!d.targets.length) d.targets = [{ category: '', subcategory: '' }];
+      renderCatmap();
+    };
+  });
+  const done = $('#cm-draft-done');
+  if (done) done.onclick = commitDraft;
+  const cancel = $('#cm-draft-cancel');
+  if (cancel) cancel.onclick = () => { S.catmapDraft = null; renderCatmap(); };
+}
+
+// Edit / remove on a saved mapping. Delegated, because the list is rebuilt on
+// every repaint.
+document.addEventListener('click', e => {
+  const edit = e.target.closest('[data-cm-edit]');
+  if (edit) { openDraft(Number(edit.dataset.cmEdit)); return; }
+  const rm = e.target.closest('[data-cm-remove]');
+  if (rm) { removeMap(Number(rm.dataset.cmRemove)); return; }
+});
+
+/** The confirmed mapping, in the shape the run expects. */
+function buildCategoryMapping() {
+  const rows = catmapList().map(m => ({
+    source: m.source,
+    source_sub: m.source_sub || '',
+    canonical: m.canonical,
+    targets: m.targets.map(t => ({ ...t })),
+    status: 'mapped',
+  }));
   return {
     rows,
-    new_in_b: S.catmap.new_in_b || [],
-    // Off unless the user asks: a B-only category has no "before" figure, so
-    // reporting it as an impact would be presenting a one-sided number.
+    new_in_b: S.catmap?.new_in_b || [],
     include_new_in_b: !!S.catmapIncludeNewInB,
   };
 }
 
-/** The canonical categories the analysis will report, in a stable order. */
+/** The categories the analysis will report, in a stable order. */
 function canonicalCategoryList() {
   const out = new Set();
-  S.catmap.rows.forEach((_, i) => {
-    const st = catmapRow(i);
-    // Only mapped rows produce a category. An unmapped one has no counterpart,
-    // so it is not a category the study can report an impact for.
-    if (st.status === 'mapped') out.add(st.canonical);
-    else if (st.status === 'excluded') return;
-  });
+  catmapList().forEach(m => { if (m.canonical) out.add(m.canonical); });
   if (S.catmapIncludeNewInB) {
-    (S.catmap.new_in_b || []).forEach(u => {
-      const claimed = S.catmap.rows.some((_, i) => {
-        const st = catmapRow(i);
-        return st.targets.some(t => t.category === u.category
-          && (t.subcategory || '') === (u.subcategory || ''));
-      });
-      if (!claimed) out.add(ukeyLabel(u));
+    const claimed = new Set();
+    catmapList().forEach(m => m.targets.forEach(
+      t => claimed.add(ukey(t.category, t.subcategory || ''))));
+    (S.catmap?.new_in_b || []).forEach(u => {
+      if (!claimed.has(akey(u))) out.add(ukeyLabel(u));
     });
   }
   return Array.from(out).sort();
 }
 
 // ---------------------------------------------------------------------------
-// step 5 — selection
+// carrying the mapping forward into the run
 // ---------------------------------------------------------------------------
+
 /**
  * Carry the user's mapping forward, and optionally run the analysis with it.
  *
@@ -1679,6 +1270,10 @@ function familyFor(profile, def) {
   }
   return '';
 }
+
+// ---------------------------------------------------------------------------
+// step 5 — selection
+// ---------------------------------------------------------------------------
 
 function buildSelectionUI() {
   // Each side gets its own metric list. They need not share a name.
@@ -2036,17 +1631,22 @@ function updateCatCount() {
     (n > 1 ? ` — will produce ${n * 2} files` : '');
 }
 
+// No text filter here on purpose: the list is already short enough to scan and
+// the selection is made by clicking, so a search box in front of it was just
+// another thing to clear before the chips were reachable.
 function renderCategories() {
-  const q = ($('#c-cat-search').value || '').toLowerCase();
   const all = S._allCategories || [];
-  const list = q ? all.filter(c => c.toLowerCase().includes(q)) : all;
-  $('#c-categories').innerHTML = list.map(c =>
+  const box = $('#c-categories');
+  if (!box) return;
+  // An empty list here is almost always "nothing has been mapped yet" rather
+  // than "no categories exist". Saying which saves a hunt through step 4.
+  box.innerHTML = all.map(c =>
     `<span class="chip ${S.selection.categories.includes(c) ? 'on' : ''}" data-cat="${esc(c)}">${esc(c)}</span>`
-  ).join('') || '<span class="hint">No match.</span>';
+  ).join('') || `<span class="hint">No categories yet — map at least one category
+      in step 4 and it will appear here.</span>`;
   updateCatCount();
 }
 
-$('#c-cat-search')?.addEventListener('input', renderCategories);
 $('#c-cat-all')?.addEventListener('click', () => {
   S.selection.categories = [...(S._allCategories || [])]; renderCategories();
 });
@@ -2418,7 +2018,7 @@ function renderEntities(m, { scale, unit, g }) {
     ${mt.length ? `
     <div class="blk">
       <div class="blk-head"><h4>Manufacturer Top-${mt.length}</h4>
-        <span class="sub">rank movement after the update</span></div>
+        <span class="sub">the ${mt.length} largest manufacturers in the previous database, followed into the updated one</span></div>
       <div class="tbl-wrap">
         <table>
           <thead><tr><th>Manufacturer</th><th>Rank BEFORE</th><th>Rank AFTER</th>
@@ -2445,7 +2045,7 @@ function renderEntities(m, { scale, unit, g }) {
     ${bt.length ? `
     <div class="blk">
       <div class="blk-head"><h4>Brand Top-${bt.length}</h4>
-        <span class="sub">rank movement after the update</span></div>
+        <span class="sub">the ${bt.length} largest brands in the previous database, followed into the updated one</span></div>
       <div class="tbl-wrap">
         <table>
           <thead><tr><th>Brand</th><th>Rank BEFORE</th><th>Rank AFTER</th>

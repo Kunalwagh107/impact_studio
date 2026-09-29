@@ -547,7 +547,9 @@ def _sheet_ranked(wb, f, block, title, cat, metric, mkt_label):
     suffix = f" ({unit})" if unit else ""
 
     ws.write(0, 0, f"{title} - {metric}{suffix}", f["title"])
-    ws.write(1, 0, f"Category: {cat}   |   Market: {mkt_label}", f["subtitle"])
+    ws.write(1, 0, f"Category: {cat}   |   Market: {mkt_label}   |   "
+                   "Selected as the largest in the previous dataset, followed into "
+                   "the updated one", f["subtitle"])
     r = 3
     headers = ["Entity", "Rank BEFORE", "Rank AFTER", "Rank change",
                "BEFORE MAT YA", "BEFORE MAT TY", "AFTER MAT YA", "AFTER MAT TY",
@@ -573,7 +575,9 @@ def _sheet_ranked(wb, f, block, title, cat, metric, mkt_label):
         ws.write(r, 9, mv, f["label_b"] if mv in ("NEW", "EXITED") else f["label"])
         r += 1
 
-    ws.write(r + 1, 0, "Rank is computed on MAT TY within the selected market(s) and category.",
+    ws.write(r + 1, 0, "Selection: the largest entities in the PREVIOUS dataset (by MAT TY "
+                       "there), then each followed into the updated one - so an entity that "
+                       "led before and shrank after still appears, at the top.",
              f["note"])
     ws.write(r + 2, 0, "Movement: NEW = only in the updated dataset, EXITED = only in the "
                        "previous dataset, GAINED/LOST = rank improved/declined, HELD = unchanged.",

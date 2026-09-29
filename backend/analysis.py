@@ -498,7 +498,22 @@ def _rank_block(
     top_n: int,
     client_entities: Sequence[str] = (),
 ) -> tuple[list[dict], list[dict]]:
-    """Rank entities in both datasets and classify their movement."""
+    """Rank entities in both datasets and classify their movement.
+
+    **The Top-N is taken from Dataset A** - the previous database - and the
+    members are then followed into Dataset B. This is the study's question: it
+    asks how the entities that were largest *before* the refresh have moved,
+    which is only answerable if the selection is made on the before value. An
+    earlier version selected on ``b_current`` and reported the after-ranking,
+    which answers a different and less useful question - "who is largest now" -
+    and silently drops an entity that led in A but shrank in B, which is exactly
+    the movement the report is meant to surface.
+
+    Ranking, movement classification and the ``rank_before`` / ``rank_after``
+    columns are computed over **every** entity in the block, then the top-N is
+    cut on A, so ``rank_change`` still means "rank in A minus rank in B" over the
+    full population.
+    """
     d = block.copy()
     d = d[d[dim].astype(str).str.len() > 0]
     d["rank_before"] = d["a_current"].rank(ascending=False, method="min", na_option="bottom")
@@ -527,8 +542,10 @@ def _rank_block(
     d.loc[~present_a & present_b, "movement"] = "NEW"
     d.loc[present_a & ~present_b, "movement"] = "EXITED"
 
-    top = d.sort_values("b_current", ascending=False, na_position="last").head(top_n)
-    top_records = [_record(r, dim, in_top="after") for _, r in top.iterrows()]
+    # Select on the previous dataset (A), then report each member's after (B)
+    # value. The cut is on a_current, deliberately - see the docstring.
+    top = d.sort_values("a_current", ascending=False, na_position="last").head(top_n)
+    top_records = [_record(r, dim, in_top="before") for _, r in top.iterrows()]
 
     # client entities are tracked independently of the Top-N cut
     client_records: list[dict] = []
@@ -547,7 +564,7 @@ def _rank_block(
             row = d[d[dim] == match].iloc[0]
             rec = _record(row, dim, in_top="client")
             rec["found"] = True
-            rec["in_top_n"] = bool(row["rank_after"] <= top_n)
+            rec["in_top_n"] = bool(row["rank_before"] <= top_n)
             client_records.append(rec)
     return top_records, client_records
 
