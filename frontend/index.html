@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Impact Studio — Data Update Impact Study</title>
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◆</span>
+    <div>
+      <h1>Impact Studio</h1>
+      <p>Automated data-update impact studies</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <span id="health" class="pill muted">checking…</span>
+    <button id="btn-files" class="btn ghost">Outputs</button>
+  </div>
+</header>
+
+<nav class="stepper" id="stepper">
+  <button class="step" data-step="1"><b>1</b><span>Datasets</span></button>
+  <button class="step" data-step="2"><b>2</b><span>Profile</span></button>
+  <button class="step" data-step="3"><b>3</b><span>Market Mapping</span></button>
+  <button class="step" data-step="4"><b>4</b><span>Categories &amp; Impacts</span></button>
+  <button class="step" data-step="5"><b>5</b><span>Selection</span></button>
+  <button class="step" data-step="6"><b>6</b><span>Analysis &amp; QC</span></button>
+  <button class="step" data-step="7"><b>7</b><span>Bulk Export</span></button>
+</nav>
+
+<main id="main">
+
+<!-- ================= STEP 1 ================= -->
+<section class="panel" data-panel="1">
+  <div class="panel-head">
+    <h2>1 · Load the two datasets</h2>
+    <p>Register the previous dataset (A) and the updated dataset (B). They may live in
+       separate files, or in one workbook distinguished by a <em>Dataset</em> column.</p>
+  </div>
+
+  <div class="grid two">
+    <div class="card">
+      <div class="card-head"><span class="tag green">A</span><h3>Previous dataset</h3></div>
+      <div class="field">
+        <label>Source</label>
+        <select id="a-source"><option value="">— select —</option></select>
+      </div>
+      <div class="field">
+        <label>Sheet</label>
+        <select id="a-sheet"><option value="">—</option></select>
+      </div>
+      <div class="field">
+        <label>Header row</label>
+        <input id="a-header" type="number" value="1" min="1">
+      </div>
+      <div class="field">
+        <label>Split by column <span class="hint">(optional)</span></label>
+        <select id="a-splitcol"><option value="">— none —</option></select>
+      </div>
+      <div class="field" id="a-value-wrap" style="display:none">
+        <label>Dataset value</label>
+        <select id="a-value"><option value="">—</option></select>
+      </div>
+      <div class="mini" id="a-summary"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><span class="tag blue">B</span><h3>Updated dataset</h3></div>
+      <div class="field">
+        <label>Source</label>
+        <select id="b-source"><option value="">— select —</option></select>
+      </div>
+      <div class="field">
+        <label>Sheet</label>
+        <select id="b-sheet"><option value="">—</option></select>
+      </div>
+      <div class="field">
+        <label>Header row</label>
+        <input id="b-header" type="number" value="1" min="1">
+      </div>
+      <div class="field">
+        <label>Split by column <span class="hint">(optional)</span></label>
+        <select id="b-splitcol"><option value="">— none —</option></select>
+      </div>
+      <div class="field" id="b-value-wrap" style="display:none">
+        <label>Dataset value</label>
+        <select id="b-value"><option value="">—</option></select>
+      </div>
+      <div class="mini" id="b-summary"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h3>Add a source</h3></div>
+    <div class="row">
+      <input type="file" id="file-input" accept=".xlsx,.xls,.xlsm,.csv,.tsv">
+      <button class="btn" id="btn-upload">Upload</button>
+    </div>
+    <div class="row">
+      <input type="text" id="path-input" placeholder="…or paste a local file path, e.g. C:\data\impact.xlsx">
+      <button class="btn" id="btn-path">Register path</button>
+    </div>
+    <p class="hint" id="upload-msg"></p>
+  </div>
+
+  <div class="actions">
+    <button class="btn primary" id="btn-profile">Probe &amp; profile both datasets →</button>
+  </div>
+</section>
+
+<!-- ================= STEP 2 ================= -->
+<section class="panel" data-panel="2" hidden>
+  <div class="panel-head">
+    <h2>2 · Dataset profile</h2>
+    <p>What the app found in each dataset: dimensions, metrics and data quality.
+       Roles are guesses — correct them in the next step if needed.</p>
+  </div>
+  <div class="grid two" id="profile-out"></div>
+  <div class="actions">
+    <button class="btn ghost" data-goto="1">← Back</button>
+    <button class="btn primary" id="btn-map">Map the market values →</button>
+  </div>
+</section>
+
+<!-- ================= STEP 3 ================= -->
+<section class="panel" data-panel="3" hidden>
+  <div class="panel-head">
+    <h2>3 · Market mapping</h2>
+    <p>Pair a market value from the previous dataset with the corresponding value
+       in the updated one, and say which level each pair belongs to. The level you
+       choose is what scopes the analysis — <em>Total Market</em> covers the values
+       you paired as totals. A market need not be named the same in both datasets;
+       that is what the two sides are for. Nothing is paired for you.</p>
+  </div>
+  <div id="map-out"></div>
+  <div class="actions">
+    <button class="btn ghost" data-goto="2">← Back</button>
+    <button class="btn primary" id="btn-catmap">Map all categories →</button>
+  </div>
+</section>
+
+<!-- ================= STEP 4 ================= -->
+<section class="panel" data-panel="4" hidden>
+  <div class="panel-head">
+    <h2>4 · Map the categories, then generate the impacts</h2>
+    <p>One action reads the category structure of both datasets and opens the
+       editor. Define how each category in the previous dataset corresponds to the
+       updated one — a single category there, a category <em>plus a subcategory</em>,
+       several of them, or nothing at all. Names are never assumed to be equal, and
+       nothing is mapped on your behalf. When you are done, the impact analysis runs
+       on what you defined. A category you leave unmapped is not analysed: it has no
+       counterpart to compare against.</p>
+  </div>
+  <div id="catmap-out"></div>
+  <div class="actions">
+    <button class="btn ghost" data-goto="3">← Back</button>
+    <button class="btn primary" id="btn-select">Run the impact analysis →</button>
+  </div>
+</section>
+
+<!-- ================= STEP 5 ================= -->
+<section class="panel" data-panel="5" hidden>
+  <div class="panel-head">
+    <h2>5 · Analysis selection</h2>
+    <p>Choose the metric and periods on each side, the market, the categories to
+       report, Top-N, and any client entities that must be tracked. The metric is
+       selected independently per dataset — the two need not name it the same way.</p>
+  </div>
+  <div class="grid two">
+    <div class="card">
+      <div class="card-head"><h3>Which metric to measure</h3></div>
+      <p class="hint" style="margin:0 0 8px">
+        The categories you confirmed and mapped are the ones that move forward.
+        Choose the impact metric — or several. Each is resolved on both datasets
+        independently, because they need not name it the same way.
+      </p>
+      <div class="metric-picks" id="c-metric-picks"></div>
+      <p class="hint" id="c-metric-rule" style="margin-top:8px"></p>
+      <details id="c-metric-advanced">
+        <summary>Per-dataset column wiring (A · B)</summary>
+        <div id="c-metric-wiring"></div>
+      </details>
+      <div id="c-metric-note"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Periods</h3></div>
+      <div id="c-periods"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Client &amp; impact</h3></div>
+      <div class="grid two tight">
+        <div class="field" style="margin:0">
+          <label>Client name</label>
+          <input type="text" id="c-client" placeholder="e.g. Acme Foods">
+        </div>
+        <div class="field" style="margin:0">
+          <label>Impact name <span class="hint">(distinguishes analyses for one client)</span></label>
+          <input type="text" id="c-impact" placeholder="e.g. Acme MAT Oct25 vs YA">
+        </div>
+      </div>
+      <p class="hint" style="margin-top:6px">Both are stamped into every Excel and
+         PowerPoint file, and into the run index, so two analyses for the same client
+         can be told apart at a glance.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h3>Scope</h3></div>
+      <div class="field"><label>Market(s)</label><div class="chips" id="c-markets"></div></div>
+      <div class="field">
+        <label>Category — select one, several, or all for bulk export</label>
+        <div class="row">
+          <input type="search" id="c-cat-search" placeholder="filter categories…">
+          <button class="btn small" id="c-cat-all">All</button>
+          <button class="btn small" id="c-cat-none">None</button>
+        </div>
+        <div class="chips scroll" id="c-categories"></div>
+        <p class="hint" id="c-cat-count">0 selected</p>
+      </div>
+      <div class="grid two tight">
+        <div class="field"><label>Top-N</label>
+          <select id="c-topn">
+            <option>5</option><option selected>10</option><option>15</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+        <div class="field" id="c-topn-custom-wrap" style="display:none">
+          <label>Custom N</label><input type="number" id="c-topn-custom" value="20" min="1">
+        </div>
+      </div>
+      <div class="field">
+        <label>Client entities to track <span class="hint">(independent of Top-N)</span></label>
+        <div class="row">
+          <input type="text" id="c-client-input" placeholder="Brand or manufacturer name">
+          <button class="btn small" id="c-client-add">Add</button>
+        </div>
+        <div class="chips" id="c-clients"></div>
+        <p class="hint">Type to search suggestions from both datasets.</p>
+        <datalist id="client-options"></datalist>
+      </div>
+    </div>
+  </div>
+  <div class="actions">
+    <button class="btn ghost" data-goto="4">← Back</button>
+    <button class="btn primary" id="btn-run">Run impact analysis →</button>
+  </div>
+</section>
+
+<!-- ================= STEP 6 ================= -->
+<section class="panel" data-panel="6" hidden>
+  <div class="panel-head">
+    <h2>6 · Impact analysis &amp; automated QC</h2>
+    <p>Before/after comparison, level shift, contribution, Top-N movement and the
+       validation results.</p>
+  </div>
+  <div id="run-out"></div>
+  <div class="actions">
+    <button class="btn ghost" data-goto="5">← Back</button>
+    <button class="btn primary" id="btn-export">Bulk generate Excel + PowerPoint →</button>
+  </div>
+</section>
+
+<!-- ================= STEP 7 ================= -->
+<section class="panel" data-panel="7" hidden>
+  <div class="panel-head">
+    <h2>7 · Bulk export</h2>
+    <p>One Excel and one PowerPoint per selected category, in a folder per category.</p>
+  </div>
+  <div class="card">
+    <div class="field"><label>Run name</label><input type="text" id="e-name" value="impact_run"></div>
+    <div class="row">
+      <label class="check"><input type="checkbox" id="e-excel" checked> Excel</label>
+      <label class="check"><input type="checkbox" id="e-pptx" checked> PowerPoint</label>
+    </div>
+  </div>
+  <div id="export-out"></div>
+  <div class="actions">
+    <button class="btn ghost" data-goto="6">← Back</button>
+    <button class="btn primary" id="btn-export-run">Generate outputs</button>
+  </div>
+</section>
+
+</main>
+
+<div class="overlay" id="overlay" hidden>
+  <div class="spinner"></div>
+  <p id="overlay-msg">Working…</p>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

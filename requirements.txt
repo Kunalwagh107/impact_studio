@@ -1,0 +1,14 @@
+# Impact Studio - runtime requirements.
+# All dependencies are permissively licensed (MIT / BSD / Apache-2.0).
+
+fastapi>=0.110            # MIT
+uvicorn[standard]>=0.27   # BSD-3-Clause
+python-multipart>=0.0.9   # Apache-2.0  (multipart form uploads)
+pydantic>=2.6             # MIT
+pandas>=2.1               # BSD-3-Clause
+numpy>=1.26               # BSD-3-Clause
+openpyxl>=3.1             # MIT        (xlsx fallback reader)
+python-calamine>=0.2      # MIT        (fast xlsx reader)
+xlsxwriter>=3.1           # BSD-2-Clause (Excel writing)
+python-pptx>=0.6.23       # MIT        (PowerPoint writing)
+rapidfuzz>=3.6            # MIT        (fuzzy dimension matching)
