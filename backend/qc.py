@@ -71,14 +71,20 @@ class QCReport:
 
 
 def check_metric_wiring(cfg, df_a, df_b, qc: QCReport) -> None:
-    """Every metric column referenced must exist and be numeric."""
+    """Every metric column referenced must exist and be numeric.
+
+    The four references are the two periods the study reads on each side, and
+    they have already been resolved from the Metric Period columns by the time
+    this runs - so a PASS here means the analysis read the columns the period
+    qualifiers name, not merely that the client sent something.
+    """
     problems = []
     for label, df, col in (
-        ("A prior", df_a, cfg.a_prior), ("A current", df_a, cfg.a_current),
-        ("B prior", df_b, cfg.b_prior), ("B current", df_b, cfg.b_current),
+        ("A MAT YA", df_a, cfg.a_prior), ("A MAT TY", df_a, cfg.a_current),
+        ("B MAT YA", df_b, cfg.b_prior), ("B MAT TY", df_b, cfg.b_current),
     ):
         if not col:
-            problems.append(f"{label}: no column selected")
+            problems.append(f"{label}: no column resolved from the period columns")
         elif col not in df.columns:
             problems.append(f"{label}: '{col}' missing from dataset")
         elif not pd.api.types.is_numeric_dtype(df[col]):
@@ -88,9 +94,12 @@ def check_metric_wiring(cfg, df_a, df_b, qc: QCReport) -> None:
                "; ".join(problems), {"problems": problems})
     else:
         qc.add("metric_wiring", "Metric column wiring", PASS,
-               f"All four metric references resolve: "
-               f"A['{cfg.a_prior}'->'{cfg.a_current}'], B['{cfg.b_prior}'->'{cfg.b_current}']",
-               {"metric": cfg.metric_label})
+               f"Both periods resolve on each side from the Metric Period "
+               f"columns: A['{cfg.a_prior}' (MAT YA) -> '{cfg.a_current}' (MAT TY)], "
+               f"B['{cfg.b_prior}' (MAT YA) -> '{cfg.b_current}' (MAT TY)]",
+               {"metric": cfg.metric_label,
+                "mat_ya": {"a": cfg.a_prior, "b": cfg.b_prior},
+                "mat_ty": {"a": cfg.a_current, "b": cfg.b_current}})
 
 
 def check_missing_values(df_a, df_b, cfg, qc: QCReport) -> None:
@@ -115,20 +124,52 @@ def check_missing_values(df_a, df_b, cfg, qc: QCReport) -> None:
 
 
 def check_duplicates(df_a, df_b, cfg, qc: QCReport) -> None:
-    """Duplicate key rows would silently double-count."""
-    keys = [c for c in [cfg.category_col, cfg.market_col,
+    """Rows that repeat on the *full* grain, which is what would double-count.
+
+    The check used to key on the dimension columns alone (category, market,
+    manufacturer, brand). On a stacked workbook - one that carries MAT TY and MAT
+    YA as separate metric columns, or as separate rows differing only by a period
+    column - that key is **not the grain**: the same manufacturer legitimately
+    appears once per period, so the "duplicates" it reported (11 rows / 50% on
+    the reference fixture) were the period structure, not a data fault. Flagging
+    them as an error trains the reader to ignore the panel.
+
+    The correct grain is every column that distinguishes a row: the dimensions
+    **plus** the period/variant and dataset discriminators. A row that repeats on
+    *that* key is genuinely duplicated and would double-count. Two reports are
+    made, because they mean different things:
+
+    * **exact duplicates** on the full grain - a real fault, `FAIL`;
+    * **dimension repeats** on the dimension key alone - expected on stacked
+      data, reported as `PASS` with a note explaining why, so the figure is
+      visible without being alarming.
+    """
+    dims = [c for c in [cfg.category_col, cfg.market_col,
                         cfg.manufacturer_col, cfg.brand_col] if c]
+    # Columns that separate legitimate repeats: the period dimension on each
+    # side, and the A/B discriminators where the datasets are stacked in one
+    # frame. Taken from the config so it follows the wiring, not a guess.
+    separators = [c for c in [cfg.period_col, cfg.period_col_b] if c]
+    extra = ["Dataset", "dataset", "__ds"]
     out = []
     worst = PASS
     checked = 0
     for label, df in (("previous", df_a), ("updated", df_b)):
-        if not keys or any(k not in df.columns for k in keys):
+        if not dims or any(k not in df.columns for k in dims):
             continue
-        sub = df[keys].astype(str)
-        dup = int(sub.duplicated().sum())
+        sep = [c for c in separators + extra if c in df.columns]
+        full = dims + sep
+        sub_full = df[full].astype(str)
+        dup = int(sub_full.duplicated().sum())
+        sub_dims = df[dims].astype(str)
+        dim_dups = int(sub_dims.duplicated().sum())
         pct = round(dup / max(len(df), 1) * 100, 4)
-        out.append({"dataset": label, "duplicate_rows": dup, "pct": pct,
-                    "keys": keys, "rows": int(len(df))})
+        out.append({"dataset": label, "duplicate_rows": dup,
+                    "duplicate_dimension_rows": dim_dups,
+                    "pct": pct, "keys": full,
+                    "dimension_keys": dims,
+                    "separators": sep,
+                    "rows": int(len(df))})
         checked += 1
         if pct > 1.0:
             worst = FAIL
@@ -139,12 +180,27 @@ def check_duplicates(df_a, df_b, cfg, qc: QCReport) -> None:
         qc.add("duplicates", "Duplicate records", WARN,
                "Not verified: no dimension columns were wired, so duplicate keys "
                "could not be tested.",
-               {"keys_wired": keys})
+               {"keys_wired": dims})
         return
-    msg = ("No duplicate dimension keys found." if worst == PASS else
-           "Duplicate dimension keys found - aggregated values may double-count "
-           "if the source rows are not intended to repeat.")
-    qc.add("duplicates", "Duplicate records", worst, msg, {"datasets": out})
+    if worst == PASS:
+        # Report the dimension-level repeats that were *not* counted as faults,
+        # so the number the reader expects to see is accounted for rather than
+        # appearing to have been suppressed.
+        repeats = {d["dataset"]: d["duplicate_dimension_rows"] for d in out
+                   if d["duplicate_dimension_rows"]}
+        msg = "No duplicate rows on the full grain."
+        if repeats:
+            msg += (" Repeats on the dimension key alone ("
+                    + ", ".join(f"{k}: {v}" for k, v in repeats.items())
+                    + ") are the period/variant structure of a stacked workbook, "
+                    "not a data fault; they are separated by the "
+                    + ", ".join(out[0]["separators"] or ["period"]) + " column(s).")
+        qc.add("duplicates", "Duplicate records", PASS, msg, {"datasets": out})
+    else:
+        qc.add("duplicates", "Duplicate records", worst,
+               "Duplicate rows found on the full grain - aggregated values may "
+               "double-count if the source rows are not intended to repeat.",
+               {"datasets": out})
 
 
 def check_mapping_coverage(mapping_results: dict, qc: QCReport) -> None:
@@ -357,139 +413,6 @@ def _label(category: str, subcategory: str = "") -> str:
     return f"{category} / {subcategory}" if subcategory else str(category)
 
 
-def check_category_totals(reports: Sequence[dict], df_a, df_b, cfg,
-                          qc: QCReport, cfgs_by_metric: dict | None = None,
-                          category_mapping=None) -> None:
-    """Category totals must reconcile with an independent recomputation.
-
-    The report's total is produced by a groupby over the prepared frame; this
-    check recomputes with a boolean mask straight off the source frames.
-
-    When a run carries several metrics, the top-level ``rep["total"]`` is only
-    the first one. Reconciling every category against that single metric's
-    columns would report failures on correct data, so each metric block is
-    reconciled against **its own** wiring (``cfgs_by_metric``), and only the
-    fallback single-metric path uses the bare ``cfg``.
-
-    ``category_mapping`` is the user-authored mapping. When supplied, each
-    canonical category's expected total is recomputed from the **union of its
-    mapped raw member units** on each side, rather than from the canonical name
-    matched against raw rows. That is what lets a merge, a 1:N, or a
-    category+subcategory composite reconcile: the two datasets define categories
-    differently, and comparing those definitions directly is the bug this
-    parameter exists to fix.
-    """
-    worst = PASS
-    bad = []
-    checked = 0
-
-    members_a = _canonical_members(category_mapping, "a")
-    members_b = _canonical_members(category_mapping, "b")
-    has_mapping = bool(members_a or members_b)
-    newly_unverifiable = 0
-
-    # (label, per-metric total, columns, is_rate, weights) tuples to verify.
-    def blocks_for(rep: dict):
-        per_metric = rep.get("metrics") or {}
-        if per_metric and cfgs_by_metric:
-            for key, blk in per_metric.items():
-                c = cfgs_by_metric.get(key)
-                if c is None:
-                    continue
-                yield (blk.get("label") or key, blk.get("total") or {}, c)
-        else:
-            yield (rep.get("metric") or "", rep.get("total") or {}, cfg)
-
-    for rep in reports:
-        cat = rep["category"]
-        for label, tot, c in blocks_for(rep):
-            if not c or not c.category_col or c.category_col not in df_a.columns:
-                continue
-            for side, df, col, sub_col, members in (
-                    ("before", df_a, c.a_current, c.category_col, members_a),
-                    ("after", df_b, c.b_current,
-                     (getattr(c, "category_col_b", "") or c.category_col),
-                     members_b)):
-                if not col or col not in df.columns:
-                    continue
-                # When a mapping exists and this category has members on this
-                # side, mask on the union of those members. A category absent
-                # from the member map on this side (mapped on the other side
-                # only) keeps the raw-name mask, which will normally find
-                # nothing and be skipped - correct, since that side has no rows
-                # for it.
-                mem = members.get(cat) if (has_mapping and cat in members) else None
-                msub = ""
-                if mem is None:
-                    # No mapping for this category on this side. Fall back to
-                    # the raw name, but only when the mapping does not also
-                    # cover this category on the other side - otherwise the two
-                    # sides would be reconciled against different definitions.
-                    other = (members_b if side == "before" else members_a).get(cat)
-                    if has_mapping and other is not None:
-                        # This side has no members but the report printed a
-                        # total for it. That is a genuine mismatch worth failing,
-                        # not skipping, so mask to nothing and let it compare.
-                        mem = []
-                else:
-                    use_sub = (getattr(c, "subcategory_col", "") if side == "before"
-                               else (getattr(c, "subcategory_col_b", "")
-                                     or getattr(c, "subcategory_col", "")))
-                    msub = use_sub if use_sub in df.columns else ""
-                expected = _independent_category_total(
-                    df, c.category_col, cat, col,
-                    is_rate=c.is_rate,
-                    weight_col=c.weight_metric if side == "before" else
-                               (c.weight_metric_b or c.weight_metric),
-                    market_col=c.market_col, markets=c.markets,
-                    members=mem, sub_col=msub)
-                got = tot.get(f"{side}_current")
-                if expected is None:
-                    # The recomputation could not be performed for a reported
-                    # value. That is "not verified", not PASS, and not FAIL -
-                    # counted so the summary can say so.
-                    if got is not None:
-                        newly_unverifiable += 1
-                    continue
-                checked += 1
-                if got is None:
-                    bad.append({"category": cat, "side": side, "metric": label,
-                                "reported": None, "recomputed": expected})
-                    worst = FAIL
-                    continue
-                denom = max(abs(expected), 1e-9)
-                rel = abs(got - expected) / denom
-                if rel > 1e-6:
-                    bad.append({"category": cat, "side": side, "metric": label,
-                                "reported": got, "recomputed": expected,
-                                "rel_diff": rel, "members": mem})
-                    worst = FAIL
-    if checked == 0:
-        # Nothing was actually compared, so PASS would be a false claim.
-        qc.add("category_totals", "Category-level totals", WARN,
-               "Not verified: the category column and metric columns are not "
-               "both wired, so totals could not be reconciled.",
-               {"categories": len(reports), "category_col": cfg.category_col})
-        return
-    if worst == PASS:
-        how = "weighted mean" if cfg.is_rate else "total"
-        msg = (f"All {checked} category {how}(s) reconcile with an independent "
-               "recomputation from the source rows (rel. tol 1e-6)")
-        if has_mapping:
-            msg += (", with each canonical category recomputed from the raw units "
-                    "its mapping folds together")
-        qc.add("category_totals", "Category-level totals", PASS,
-               msg + ".",
-               {"comparisons": checked, "is_rate": bool(cfg.is_rate),
-                "via_mapping": has_mapping,
-                "metrics": sorted((cfgs_by_metric or {}).keys()) or None})
-    else:
-        qc.add("category_totals", "Category-level totals", FAIL,
-               f"{len(bad)} of {checked} category total(s) failed to reconcile.",
-               {"mismatches": bad[:25], "n": len(bad),
-                "via_mapping": has_mapping})
-
-
 def check_percentages(reports: Sequence[dict], qc: QCReport) -> None:
     """Growth, share and contribution arithmetic must be internally correct."""
     worst = PASS
@@ -508,15 +431,27 @@ def check_percentages(reports: Sequence[dict], qc: QCReport) -> None:
                 bad.append({"category": rep["category"], "side": side,
                             "reported": g, "expected": expect})
                 worst = FAIL
-        # shares within the channel block must sum to 100 (within rounding)
-        ch = rep.get("channel_block") or []
-        if ch:
+        # Shares within a market block must sum to 100 (within rounding) - but
+        # only when the block is a *complete* partition of the market. The Total
+        # legitimately sits in `channel_block` alongside members that are a
+        # subset of it (the extract omits channels the Total covers), so summing
+        # the whole block and expecting 100 was asserting something false about
+        # correct data. Test the members at each level instead, and only when the
+        # block carries an explicit level split.
+        for blk_key in ("channel_level_block", "region_level_block",
+                        "market_other_block"):
+            blk = rep.get(blk_key)
+            if not blk or not (blk.get("members") or []):
+                continue
             for side in ("before", "after"):
-                tot_share = sum(c["contribution"][f"{side}_share_pct"] or 0 for c in ch)
+                tot_share = sum(
+                    c["contribution"][f"{side}_share_pct"] or 0
+                    for c in blk["members"])
                 checked += 1
                 if abs(tot_share - 100) > 0.5:
                     bad.append({"category": rep["category"],
-                                "side": side, "share_sum": round(tot_share, 4)})
+                                "side": side, "block": blk_key,
+                                "share_sum": round(tot_share, 4)})
                     if worst != FAIL:
                         worst = WARN
     if checked == 0:
@@ -748,15 +683,11 @@ def run_qc(reports: Sequence[dict], cfg, df_a, df_b,
            category_mapping=None) -> QCReport:
     """Run every check.
 
-    ``cfgs_by_metric`` maps a metric key to the ``AnalysisConfig`` used to build
-    that metric's block, and is only needed when a run carries several metrics.
-    Each metric's totals are then reconciled against its own wiring rather than
-    against the first metric's columns.
-
-    ``category_mapping`` is the user-authored mapping object (``rows`` /
-    ``targets``). It is passed to the totals check so a canonical category is
-    recomputed from the raw units its mapping folds together, which is what makes
-    a merge / 1:N / composite mapping reconcile instead of failing.
+    ``cfgs_by_metric`` and ``category_mapping`` are retained in the signature for
+    call-site compatibility but are **no longer consumed**: both existed to serve
+    the category-level totals reconciliation, which was removed on request. They
+    are accepted rather than dropped so existing callers keep working without
+    edits; nothing in this function reads them any more.
     """
     qc = QCReport()
     check_metric_wiring(cfg, df_a, df_b, qc)
@@ -764,8 +695,6 @@ def run_qc(reports: Sequence[dict], cfg, df_a, df_b,
     check_duplicates(df_a, df_b, cfg, qc)
     check_mapping_coverage(mapping_results or {}, qc)
     check_invalid_mappings(mapping_results or {}, qc)
-    check_category_totals(reports, df_a, df_b, cfg, qc, cfgs_by_metric,
-                          category_mapping=category_mapping)
     check_percentages(reports, qc)
     check_topn(reports, cfg, qc)
     check_before_after_consistency(reports, qc)

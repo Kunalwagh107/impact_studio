@@ -96,7 +96,6 @@ def build_category_workbook(
             "total": report.get("total") or {},
             "insights": report.get("insights") or [],
             "channel_block": report.get("channel_block") or [],
-            "brand_block": report.get("brand_block") or [],
             "manufacturer_top_n": report.get("manufacturer_top_n") or [],
             "brand_top_n": report.get("brand_top_n") or [],
             "client_brands": report.get("client_brands") or [],
@@ -116,6 +115,12 @@ def build_category_workbook(
         view["channel_block"] = blk.get("channel_block") or []
         view["growth_applicable"] = blk.get("growth_applicable", True)
         view["is_rate_metric"] = blk.get("is_rate_metric", False)
+        # Each metric carries its own baseline. Without this the sheet would
+        # inherit the head metric's, which decides whether the trailing sum row
+        # is suppressed - so the wrong name would silently reinstate a
+        # double-count on a secondary metric's sheet.
+        if blk.get("baseline"):
+            view["baseline"] = blk["baseline"]
         suffix = f" ({metric})" if multi else ""
         _sheet_summary(wb, f, view, qc, meta, cat, metric, mkt_label,
                        sheet_name=("Summary" + suffix)[:31])
@@ -126,7 +131,6 @@ def build_category_workbook(
     # Entity-level sheets follow the first metric.
     primary = next(iter(metrics.values()))
     report = dict(report)
-    report["brand_block"] = primary.get("brand_block") or []
     report["manufacturer_top_n"] = primary.get("manufacturer_top_n") or []
     report["brand_top_n"] = primary.get("brand_top_n") or []
     report["client_brands"] = primary.get("client_brands") or []
@@ -134,8 +138,6 @@ def build_category_workbook(
     report["contributors"] = primary.get("contributors") or []
     metric = primary.get("label") or report.get("metric", "")
 
-    if report.get("brand_block"):
-        _sheet_brand_share(wb, f, report, cat, metric, mkt_label)
     if report.get("manufacturer_top_n") is not None:
         _sheet_ranked(wb, f, report.get("manufacturer_top_n") or [],
                       "Manufacturer Top-N", cat, metric, mkt_label)
@@ -323,7 +325,6 @@ def _sheet_summary(wb, f, report, qc, meta, cat, metric, mkt_label,
     notes = [
         "Summary        - headline before/after and the impact of the update.",
         "Channel Block  - BEFORE vs AFTER by market/channel with level shift and contribution.",
-        "Brand Value Share - brand shares before and after, with share change in pp.",
         "Manufacturer Top-N / Brand Top-N - ranked entities and how they moved.",
         "Client Brands  - client entities tracked regardless of their rank.",
         "Contributors   - largest gainers and losers driving the category change.",
@@ -387,13 +388,21 @@ def _sheet_channel(wb, f, report, cat, metric, mkt_label,
 
         start = r
         for b in blocks:
-            ws.write(r, 0, b["name"], f["label"])
+            # The Total Market leads the block (it is `baseline_market`) and is
+            # styled as a total row, because the members beneath it are a subset
+            # of it - reading it as one more channel is the double-count this
+            # layout exists to avoid.
+            is_total = bool(report.get("baseline", {}).get("name")) and \
+                b["name"] == report["baseline"]["name"]
+            lab_f = f["tot_row"] if is_total else f["label"]
+            num_f = f["tot_val2"] if is_total else f["val2"]
+            ws.write(r, 0, ("Total Market · " + b["name"]) if is_total else b["name"], lab_f)
             for base, side in ((1, "before"), (4, "after")):
                 ya = b[side]["mat_ya"]; ty = b[side]["mat_ty"]; gr = b[side]["growth_pct"]
                 if ya is not None:
-                    ws.write_number(r, base, ya / scale, f["val2"])
+                    ws.write_number(r, base, ya / scale, num_f)
                 if ty is not None:
-                    ws.write_number(r, base + 1, ty / scale, f["val2"])
+                    ws.write_number(r, base + 1, ty / scale, num_f)
                 if gr is not None:
                     ws.write_number(r, base + 2, gr / 100,
                                     f["pct_red"] if gr < 0 else f["pct"])
@@ -452,88 +461,64 @@ def _sheet_channel(wb, f, report, cat, metric, mkt_label,
             r += 1
         end = r - 1
 
-    # total row
+    # Total row -------------------------------------------------------------
+    #
+    # The Total Market already leads this block (it is the baseline, styled as a
+    # total row). `report["total"]` is the sum over *every* row of the category,
+    # which in a stacked source file means the Total Market row plus its own
+    # members - a double count. So when a baseline Total Market is present the
+    # trailing row is omitted entirely: printing it would both duplicate the head
+    # row and overstate it. The row survives only when no Total was designated,
+    # where it is the sole aggregate the block has, and is labelled as the sum of
+    # the rows above so it cannot be mistaken for a market total.
     t = report["total"]
-    ws.write(r, 0, "Total", f["tot_row"])
+    baseline_name = (report.get("baseline") or {}).get("name")
+    note_at = r
+    if not baseline_name:
+        ws.write(r, 0, "Total (sum of rows above)", f["tot_row"])
+        note_at = r + 2
+        if growth_ok:
+            for base, side in ((1, "before"), (4, "after")):
+                ya, ty, gr = t.get(f"{side}_prior"), t.get(f"{side}_current"), t.get(f"{side}_growth_pct")
+                if ya is not None:
+                    ws.write_number(r, base, ya / scale, f["tot_val2"])
+                if ty is not None:
+                    ws.write_number(r, base + 1, ty / scale, f["tot_val2"])
+                if gr is not None:
+                    ws.write_number(r, base + 2, gr / 100, f["tot_pct"])
+            if t.get("level_shift_pp") is not None:
+                ws.write_number(r, 7, t["level_shift_pp"], f["tot_pp"])
+            for col in (8, 9, 10, 11):
+                ws.write_number(r, col, 1.0, f["tot_pct"])
+            ws.write_number(r, 12, (t.get("abs_change") or 0) / scale, f["tot_val2"])
+        else:
+            for base, side in ((1, "before"), (3, "after")):
+                ya, ty = t.get(f"{side}_prior"), t.get(f"{side}_current")
+                if ya is not None:
+                    ws.write_number(r, base, ya / scale, f["tot_val2"])
+                if ty is not None:
+                    ws.write_number(r, base + 1, ty / scale, f["tot_val2"])
+            if t.get("abs_change") is not None:
+                ws.write_number(r, 5, t["abs_change"] / scale, f["tot_val2"])
+            for col in (6, 7, 8, 9):
+                ws.write_number(r, col, 1.0, f["tot_pct"])
+
     if growth_ok:
-        for base, side in ((1, "before"), (4, "after")):
-            ya, ty, gr = t.get(f"{side}_prior"), t.get(f"{side}_current"), t.get(f"{side}_growth_pct")
-            if ya is not None:
-                ws.write_number(r, base, ya / scale, f["tot_val2"])
-            if ty is not None:
-                ws.write_number(r, base + 1, ty / scale, f["tot_val2"])
-            if gr is not None:
-                ws.write_number(r, base + 2, gr / 100, f["tot_pct"])
-        if t.get("level_shift_pp") is not None:
-            ws.write_number(r, 7, t["level_shift_pp"], f["tot_pp"])
-        for col in (8, 9, 10, 11):
-            ws.write_number(r, col, 1.0, f["tot_pct"])
-        ws.write_number(r, 12, (t.get("abs_change") or 0) / scale, f["tot_val2"])
-        ws.write(r + 2, 0, "Column M = absolute change in MAT TY (AFTER - BEFORE).",
+        ws.write(note_at, 0, "Column M = absolute change in MAT TY (AFTER - BEFORE).",
                  f["note"])
-        ws.write(r + 3, 0, "Level Shift MATTY = AFTER growth - BEFORE growth, in percentage points.",
+        ws.write(note_at + 1, 0, "Level Shift MATTY = AFTER growth - BEFORE growth, in percentage points.",
                  f["note"])
-        ws.write(r + 4, 0, "Before/After under Level Shift and Contribution are shares of the "
-                           "category total in each dataset.", f["note"])
+        ws.write(note_at + 2, 0, "Before/After under Level Shift and Contribution are shares of the "
+                                 "category total in each dataset.", f["note"])
+        if baseline_name:
+            ws.write(note_at + 3, 0, "The Total Market leads this block; it is not repeated at "
+                                     "the foot, because its members are a subset of it.",
+                     f["note"])
     else:
-        for base, side in ((1, "before"), (3, "after")):
-            ya, ty = t.get(f"{side}_prior"), t.get(f"{side}_current")
-            if ya is not None:
-                ws.write_number(r, base, ya / scale, f["tot_val2"])
-            if ty is not None:
-                ws.write_number(r, base + 1, ty / scale, f["tot_val2"])
-        if t.get("abs_change") is not None:
-            ws.write_number(r, 5, t["abs_change"] / scale, f["tot_val2"])
-        for col in (6, 7, 8, 9):
-            ws.write_number(r, col, 1.0, f["tot_pct"])
-        ws.write(r + 2, 0, "This metric is a distribution level. Its impact is the absolute "
-                           "change TY - YA; no percentage growth is computed.", f["note"])
-        ws.write(r + 3, 0, "Before/After shares under Contribution are shares of the "
-                           "category total in each dataset.", f["note"])
-    ws.freeze_panes(5, 1)
-
-
-def _sheet_brand_share(wb, f, report, cat, metric, mkt_label):
-    ws = wb.add_worksheet("Brand Value Share")
-    ws.set_column("A:A", 34)
-    ws.set_column("B:G", 14)
-
-    blocks = report["brand_block"][:40]
-    scale, unit = _scale_of(*[b["after"]["mat_ty"] for b in blocks],
-                            *[b["before"]["mat_ty"] for b in blocks])
-
-    ws.write(0, 0, f"Value Share (%) - {metric}", f["title"])
-    ws.write(1, 0, f"Category: {cat}   |   Market: {mkt_label}   |   "
-                   f"Top {len(blocks)} brands by updated {metric}", f["subtitle"])
-    r = 3
-    ws.write(r, 0, "Brands", f["hdr_grey"])
-    ws.merge_range(r, 1, r, 3, "BEFORE", f["hdr_green"])
-    ws.merge_range(r, 4, r, 6, "AFTER", f["hdr_blue"])
-    r += 1
-    for c, h in [(1, "MAT YA"), (2, "MAT TY"), (3, "MAT share chg"),
-                 (4, "MAT YA"), (5, "MAT TY"), (6, "MAT share chg")]:
-        ws.write(r, c, h, f["hdr_green"] if c <= 3 else f["hdr_blue"])
-    r += 1
-
-    for b in blocks:
-        ws.write(r, 0, b["name"], f["label"])
-        for base, side in ((1, "before"), (4, "after")):
-            s = b[side]
-            if s["share_pct"] is not None:
-                ws.write_number(r, base, s["share_pct"] / 100, f["pct"])
-            if s["share_pct"] is not None:
-                ws.write_number(r, base + 1, s["share_pct"] / 100, f["pct"])
-            chg = s.get("share_chg_pp")
-            if side == "after":
-                chg = b["after"]["share_pct"] - b["before"]["share_pct"] \
-                    if (b["after"]["share_pct"] is not None and
-                        b["before"]["share_pct"] is not None) else None
-            if chg is not None:
-                ws.write_number(r, base + 2, chg / 100,
-                                f["pp_red"] if chg < 0 else f["pp"])
-        r += 1
-    ws.write(r + 1, 0, "MAT share chg = share in MAT TY minus share in MAT YA, in percentage points.",
-             f["note"])
+        ws.write(note_at, 0, "This metric is a distribution level. Its impact is the absolute "
+                             "change TY - YA; no percentage growth is computed.", f["note"])
+        ws.write(note_at + 1, 0, "Before/After shares under Contribution are shares of the "
+                                 "category total in each dataset.", f["note"])
     ws.freeze_panes(5, 1)
 
 
@@ -551,26 +536,33 @@ def _sheet_ranked(wb, f, block, title, cat, metric, mkt_label):
                    "Selected as the largest in the previous dataset, followed into "
                    "the updated one", f["subtitle"])
     r = 3
-    headers = ["Entity", "Rank BEFORE", "Rank AFTER", "Rank change",
-               "BEFORE MAT YA", "BEFORE MAT TY", "AFTER MAT YA", "AFTER MAT TY",
-               "MAT TY change", "Movement"]
+    # Column order: Entity, MAT YA, MAT TY, Before, After, Share change, then the
+    # ranks. This is the Market Regions layout, so the two tables read the same
+    # way. Growth is deliberately absent: for a ranked entity the share change is
+    # the comparable movement, and a growth column here was the odd one out.
+    headers = ["Entity", "MAT YA", "MAT TY", "Before", "After", "Share change",
+               "Rank BEFORE", "Rank AFTER", "Rank change", "Movement"]
     for i, h in enumerate(headers):
         ws.write(r, i, h, f["hdr_grey"])
     r += 1
 
     for b in block:
         ws.write(r, 0, b["name"], f["label"])
-        ws.write_number(r, 1, b["rank_before"] or 0, f["val"])
-        ws.write_number(r, 2, b["rank_after"] or 0, f["val"])
-        rc = b["rank_change"]
-        ws.write_number(r, 3, rc if rc is not None else 0,
-                        f["pp_red"] if (rc is not None and rc < 0) else f["pp"])
-        for col, key in ((4, "before_prior"), (5, "before_current"),
-                         (6, "after_prior"), (7, "after_current"),
-                         (8, "abs_change")):
-            v = b.get(key)
+        # MAT YA / MAT TY are the BEFORE side's prior and current periods - the
+        # same source the Market Regions block reads (`mat_ya` / `mat_ty`).
+        values = [(1, b.get("before_prior")), (2, b.get("before_current")),
+                  (3, b.get("before_current")), (4, b.get("after_current"))]
+        for col, v in values:
             if v is not None:
                 ws.write_number(r, col, v / scale, f["val2"])
+        sc = b.get("share_change_pp")
+        if sc is not None:
+            ws.write_number(r, 5, sc / 100, f["pp_red"] if sc < 0 else f["pp"])
+        ws.write_number(r, 6, b["rank_before"] or 0, f["val"])
+        ws.write_number(r, 7, b["rank_after"] or 0, f["val"])
+        rc = b["rank_change"]
+        ws.write_number(r, 8, rc if rc is not None else 0,
+                        f["pp_red"] if (rc is not None and rc < 0) else f["pp"])
         mv = b.get("movement") or ""
         ws.write(r, 9, mv, f["label_b"] if mv in ("NEW", "EXITED") else f["label"])
         r += 1
@@ -579,7 +571,11 @@ def _sheet_ranked(wb, f, block, title, cat, metric, mkt_label):
                        "there), then each followed into the updated one - so an entity that "
                        "led before and shrank after still appears, at the top.",
              f["note"])
-    ws.write(r + 2, 0, "Movement: NEW = only in the updated dataset, EXITED = only in the "
+    ws.write(r + 2, 0, "MAT YA / MAT TY are the previous dataset's MAT; Before / After are "
+                       "the category level in each dataset with share change of the "
+                       "category total. No growth column, matching the Market Regions block.",
+             f["note"])
+    ws.write(r + 3, 0, "Movement: NEW = only in the updated dataset, EXITED = only in the "
                        "previous dataset, GAINED/LOST = rank improved/declined, HELD = unchanged.",
              f["note"])
     ws.freeze_panes(4, 1)

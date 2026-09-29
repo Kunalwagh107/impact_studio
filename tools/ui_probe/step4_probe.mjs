@@ -142,8 +142,27 @@ async function main() {
   // Setting `window.S.sourceId` directly does not register anything: the
   // source list is rendered from the server, and step 1 stays empty. Drive the
   // real control, then read the option list the page actually offers.
-  await setInput('#path-input', WORKBOOK)
-  await click('#btn-path')
+  // Step 1 is upload-first now (no #path-input / #btn-path), so the workbook
+  // goes in through the hidden #file-input and then #btn-upload. The bytes are
+  // fetched back from /__workbook/ - a `new File([''])` uploads 0 bytes and makes
+  // every later read 500, which looks like a broken control rather than a
+  // broken probe.
+  const up = await evaluate(`(async () => {
+    const el = document.querySelector('#file-input')
+    if (!el) return 'NOT_FOUND'
+    const name = ${JSON.stringify(WORKBOOK)}.split(/[\\\\/]/).pop()
+    const r = await fetch('/__workbook/' + encodeURIComponent(name), { cache: 'no-store' })
+    if (!r.ok) return 'fetch ' + r.status
+    const buf = await r.arrayBuffer()
+    if (!buf || buf.byteLength === 0) return 'served 0 bytes'
+    const dt = new DataTransfer()
+    dt.items.add(new File([buf], name, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
+    el.files = dt.files
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+    return 'ok:' + buf.byteLength
+  })()`)
+  console.log('  upload:', up)
+  await click('#btn-upload')
   await sleep(4000)
   const reg = await evaluate(`document.querySelector('#upload-msg')?.textContent`)
   console.log('  register:', reg)

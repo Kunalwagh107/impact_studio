@@ -245,9 +245,16 @@ def part1() -> None:
     cb = hf.get("channel_block") or []
     check("channel block produced", len(cb) >= 1, f"{len(cb)} channels")
     if cb:
-        share_sum = sum(c["contribution"]["after_share_pct"] or 0 for c in cb)
+        # The Total Market leads the block when a baseline was designated. It is
+        # *not* a member, so summing the whole block and expecting 100 would be
+        # asserting that the Total is one of its own channels - which is exactly
+        # the double-count the layout avoids.
+        base_name = (hf.get("baseline") or {}).get("name")
+        members = [c for c in cb if c["name"] != base_name]
+        share_sum = sum(c["contribution"]["after_share_pct"] or 0 for c in members)
         check("channel shares sum to 100%", abs(share_sum - 100) < 0.01,
-              f"{share_sum:.4f}%")
+              f"{share_sum:.4f}% over {len(members)} member(s)"
+              + (f", total '{base_name}' excluded" if base_name else ""))
 
     # --- Top-N and client brands -------------------------------------------
     # The Top-N is drawn from the PREVIOUS dataset, so the block is ordered by
@@ -333,13 +340,18 @@ def part1() -> None:
 
     xp = files[0]
     wb = openpyxl.load_workbook(xp)
-    expected_sheets = {"Summary", "Channel Block", "Brand Value Share",
+    # Brand Value Share was removed on request, so it must be absent - and the
+    # assertion is written to fail if it ever comes back, not merely to skip it.
+    expected_sheets = {"Summary", "Channel Block",
                        "Manufacturer Top-N", "Brand Top-N", "Client Brands",
                        "Contributors", "QC"}
     got_sheets = set(wb.sheetnames)
     check("Excel contains every expected sheet", expected_sheets <= got_sheets,
           f"missing {expected_sheets - got_sheets}" if expected_sheets - got_sheets
           else f"{len(got_sheets)} sheets")
+    check("Excel does not contain the removed Brand Value Share sheet",
+          "Brand Value Share" not in got_sheets,
+          f"sheets={sorted(got_sheets)}")
 
     # the Excel must agree with the report it was built from
     ws = wb["Summary"]
@@ -461,103 +473,29 @@ def part3() -> None:
     check("completeness PASSES when all files exist",
           qc2.checks[-1].status == QC.PASS, f"status={qc2.checks[-1].status}")
 
-    # --- category totals must catch a corrupted number ---------------------
-    # Build a minimal two-dataset fixture where the report total is wrong by 1.
-    df_a = pd.DataFrame({"CATEGORY": ["X", "X"], "Sales Value YA": [100.0, 100.0],
-                         "Sales Value": [110.0, 120.0]})
-    df_b = pd.DataFrame({"CATEGORY": ["X", "X"], "Sales Value YA": [100.0, 100.0],
-                         "Sales Value": [130.0, 140.0]})
-    wired = A.AnalysisConfig(top_n=5, category_col="CATEGORY",
-                             a_current="Sales Value", b_current="Sales Value")
-    bare = A.AnalysisConfig(top_n=5)          # nothing wired
-
-    good = {"category": "X", "total": {"before_current": 230.0, "after_current": 270.0}}
-    bad = {"category": "X", "total": {"before_current": 231.0, "after_current": 270.0}}
-
-    qc3 = QC.QCReport()
-    QC.check_category_totals([good], df_a, df_b, wired, qc3)
-    check("category totals PASS on a correct total",
-          qc3.checks[-1].status == QC.PASS, f"status={qc3.checks[-1].status}")
-
-    qc4 = QC.QCReport()
-    QC.check_category_totals([bad], df_a, df_b, wired, qc4)
-    check("category totals FAIL on an off-by-one total",
-          qc4.checks[-1].status == QC.FAIL,
-          f"status={qc4.checks[-1].status}")
-
-    # --- category totals must reconcile THROUGH the mapping ----------------
-    # The case the check used to get wrong: a canonical category whose raw
-    # members are named differently on each side, which is the whole point of
-    # the category mapping. Comparing the two raw definitions directly skipped
-    # or failed on data that is correct.
-    #
-    # Dataset A: two raw units ("SNACKS / CHIPS", "SNACKS / NUTS") fold into
-    # the canonical "Snacks" - the user authors one row per unit, sharing the
-    # canonical name. Dataset B names the counterpart "SAVOURY / CHIPS".
-    src_a = pd.DataFrame({
-        "CATEGORY": ["SNACKS", "SNACKS", "OTHER"],
-        "SUBCATEGORY": ["CHIPS", "NUTS", ""],
-        "Sales Value": [110.0, 120.0, 999.0],
-    })
-    src_b = pd.DataFrame({
-        "CATEGORY": ["SAVOURY", "OTHER"],
-        "SUBCATEGORY": ["CHIPS", ""],
-        "Sales Value": [270.0, 999.0],
-    })
-    mapped = A.AnalysisConfig(top_n=5, category_col="CATEGORY",
-                              subcategory_col="SUBCATEGORY",
-                              category_col_b="CATEGORY",
-                              subcategory_col_b="SUBCATEGORY",
-                              a_current="Sales Value", b_current="Sales Value")
-    cm_rows = [
-        {"source": "SNACKS", "source_sub": "CHIPS", "canonical": "Snacks",
-         "status": "mapped",
-         "targets": [{"category": "SAVOURY", "subcategory": "CHIPS"}]},
-        {"source": "SNACKS", "source_sub": "NUTS", "canonical": "Snacks",
-         "status": "mapped",
-         "targets": [{"category": "SAVOURY", "subcategory": "CHIPS"}]},
-    ]
-
-    class _CM:  # the shape run_qc receives
-        rows = cm_rows
-
-    good_map = {"category": "Snacks",
-                "total": {"before_current": 230.0, "after_current": 270.0}}
-    bad_map = {"category": "Snacks",
-               "total": {"before_current": 999.0, "after_current": 270.0}}
-
-    qc_m1 = QC.QCReport()
-    QC.check_category_totals([good_map], src_a, src_b, mapped, qc_m1,
-                             category_mapping=_CM)
-    check("category totals PASS when a merge/1:N reconciles through the mapping",
-          qc_m1.checks[-1].status == QC.PASS,
-          f"status={qc_m1.checks[-1].status} · {qc_m1.checks[-1].message[:70]}")
-
-    qc_m2 = QC.QCReport()
-    QC.check_category_totals([bad_map], src_a, src_b, mapped, qc_m2,
-                             category_mapping=_CM)
-    check("category totals FAIL when a mapped category total is wrong",
-          qc_m2.checks[-1].status == QC.FAIL,
-          f"status={qc_m2.checks[-1].status}")
-
-    # And the mutation that used to survive: the raw-name comparison. Without
-    # the mapping, the canonical name matches no raw row on B, so the old code
-    # silently compared only A's partial match. Assert the mapped path is what
-    # makes it pass, by showing the unmapped path does NOT confirm the value.
-    qc_m3 = QC.QCReport()
-    QC.check_category_totals([good_map], src_a, src_b, mapped, qc_m3)
-    check("without the mapping the canonical total is not verified against B",
-          qc_m3.checks[-1].status != QC.PASS or
-          qc_m3.checks[-1].detail.get("via_mapping") is not True,
-          f"status={qc_m3.checks[-1].status}")
-
-    # A check that cannot run must not report PASS - that would be a claim it
-    # never verified.
-    qc4b = QC.QCReport()
-    QC.check_category_totals([good], df_a, df_b, bare, qc4b)
-    check("category totals report NOT-VERIFIED (WARN) when unwired",
-          qc4b.checks[-1].status == QC.WARN,
-          f"status={qc4b.checks[-1].status} msg={qc4b.checks[-1].message[:60]}")
+    # --- category-level totals were removed on request ----------------------
+    # This check reconciled every category total against an independent
+    # recomputation. It was deliberately removed, so assert its absence rather
+    # than let it quietly reappear. The helper it was built on
+    # (`_independent_category_total`) is still exercised directly further down,
+    # because the ND weighted-mean rule it encodes is a real behaviour worth
+    # pinning - only the *check* is gone, not the arithmetic.
+    check("the category-level totals check is removed from the module",
+          not hasattr(QC, "check_category_totals"),
+          f"hasattr={hasattr(QC, 'check_category_totals')}")
+    # A minimal frame, so run_qc has something to walk. Part 3 is self-contained
+    # on purpose - reaching for another part's fixture is how a test ends up
+    # passing because of a frame it never built.
+    _df = pd.DataFrame({"CATEGORY": ["X"], "Sales Value": [1.0]})
+    _qc_removed = QC.run_qc([], cfg, _df, _df)
+    check("run_qc no longer emits a category_totals check",
+          all(c.id != "category_totals" for c in _qc_removed.checks),
+          f"ids={[c.id for c in _qc_removed.checks]}")
+    # run_qc still accepts the two parameters that existed only to feed it, so
+    # callers (main.py) need no edit - assert that rather than assume it.
+    QC.run_qc([], cfg, _df, _df, cfgs_by_metric={}, category_mapping=None)
+    check("run_qc still accepts cfgs_by_metric / category_mapping",
+          True, "signature retained for call-site compatibility")
 
     # --- Top-N must catch an oversized block -------------------------------
     # The block is selected and ordered on the previous dataset, so the fixture
@@ -637,22 +575,50 @@ def part3() -> None:
           qc7.checks[-1].status == QC.FAIL, f"status={qc7.checks[-1].status}")
 
     # --- duplicates must catch a repeated key ------------------------------
+    # Two rows identical on the full grain (there is no period column here to
+    # separate them), so this *is* a genuine duplicate and must be flagged.
     dup = pd.DataFrame({"CATEGORY": ["X", "X"], "Sales Value": [1.0, 2.0]})
+    # `wired` used to be defined by the category-totals test above; that test is
+    # gone, so it is defined here at its own point of use. It is also needed by
+    # the "real run" assertion at the end of this part.
+    wired = A.AnalysisConfig(top_n=5, category_col="CATEGORY",
+                             a_current="Sales Value", b_current="Sales Value")
     qc8 = QC.QCReport()
     QC.check_duplicates(dup, dup, wired, qc8)
-    check("duplicates WARNs on repeated dimension keys",
+    check("duplicates flags a repeat on the full grain",
           qc8.checks[-1].status in (QC.WARN, QC.FAIL),
           f"status={qc8.checks[-1].status}")
 
+    # The same dimension rows are *not* duplicates once a period column
+    # separates them - that is a stacked workbook, not a fault.
+    stacked = pd.DataFrame({"CATEGORY": ["X", "X"], "PERIOD": ["TY", "YA"],
+                            "Sales Value": [1.0, np.nan]})
+    wired_p = A.AnalysisConfig(category_col="CATEGORY", period_col="PERIOD")
+    qc8b = QC.QCReport()
+    QC.check_duplicates(stacked, stacked, wired_p, qc8b)
+    check("duplicates does not flag a period-stacked frame",
+          qc8b.checks[-1].status == QC.PASS,
+          f"status={qc8b.checks[-1].status} {qc8b.checks[-1].message[:80]}")
+
+    # Same first point of use: a config with no dimension columns wired, so the
+    # check has nothing to key on and must say so rather than pass.
+    bare = A.AnalysisConfig(top_n=5)
     qc9 = QC.QCReport()
     QC.check_duplicates(dup, dup, bare, qc9)
     check("duplicates report NOT-VERIFIED when unwired",
           qc9.checks[-1].status == QC.WARN, f"status={qc9.checks[-1].status}")
 
     # --- every check in a real run must have actually run ------------------
+    # The frames are built here rather than borrowed from part1: `df_a`/`df_b`
+    # are part1's *locals* (never module globals), so the previous version of
+    # this assertion could never have executed - it raised NameError on its very
+    # first run and took the rest of part3 with it. A self-contained fixture is
+    # the only honest way to assert "a real run verifies things".
+    run_a = pd.DataFrame({"CATEGORY": ["X", "Y"], "Sales Value": [230.0, 10.0]})
+    run_b = pd.DataFrame({"CATEGORY": ["X", "Y"], "Sales Value": [270.0, 12.0]})
     n_verified = sum(1 for c in (QC.run_qc(
         [{"category": "X", "total": {"before_current": 230.0, "after_current": 270.0},
-          "channel_block": []}], wired, df_a, df_b).checks)
+          "channel_block": []}], wired, run_a, run_b).checks)
         if c.status == QC.PASS)
     check("a wired run produces real PASS results, not skips", n_verified >= 2,
           f"{n_verified} PASS")
@@ -1517,6 +1483,500 @@ def part8() -> None:
 
 
 # ===========================================================================
+# PART 9 - market levels, the duplicate grain, and generalised periods
+# ===========================================================================
+#
+# Three behaviours this session changed, each of which the reference workbook
+# cannot demonstrate on its own:
+#
+#  * the market dimension is presented as **one block per level** (Total at the
+#    top, then its channels / its regions), with the Total never repeated among
+#    its own members;
+#  * the duplicate check keys on the **full grain** including the period
+#    separator, because a stacked workbook (MAT TY + MAT YA) repeats its
+#    dimension rows by design;
+#  * the period vocabulary is **recognised, not assumed**, so a translated or
+#    unrecognised qualifier still resolves to two concrete columns.
+
+
+def part9() -> None:
+    banner("PART 9 - market levels, duplicate grain, generalised periods")
+
+    # --- the level split ----------------------------------------------------
+    # TOTAL covers more than the listed channels (55% in the reference data), and
+    # there are two regions as well. The blocks must be separate, and the Total
+    # must appear once at the head of each - never inside `members`, or a reader
+    # summing the block counts it twice.
+    df = pd.DataFrame({
+        "CATEGORY": ["C1"] * 6,
+        "MKT": ["TOTAL", "CH-A", "CH-B", "RG-N", "RG-S", "OTHER-1"],
+        "Sales Value YA": [90.0, 27.0, 18.0, 20.0, 22.0, 3.0],
+        "Sales Value": [100.0, 30.0, 20.0, 24.0, 25.0, 1.0],
+    })
+    cfg = A.AnalysisConfig(
+        a_prior="Sales Value YA", a_current="Sales Value",
+        b_prior="Sales Value YA", b_current="Sales Value",
+        category_col="CATEGORY", market_col="MKT",
+        markets=["TOTAL", "CH-A", "CH-B", "RG-N", "RG-S", "OTHER-1"],
+        baseline_market="TOTAL",
+        market_levels={"TOTAL": "total", "CH-A": "channel", "CH-B": "channel",
+                       "RG-N": "region", "RG-S": "region"},
+    )
+    rep = A.category_report(A.prepare(df, df, cfg), "C1")
+    blocks = rep["blocks"]
+
+    ch = blocks.get("channel")
+    rg = blocks.get("region")
+    check("a Market / Channel block is produced when channels are paired",
+          bool(ch) and len(ch["members"]) == 2,
+          f"members={[m['name'] for m in (ch or {}).get('members', [])]}")
+    check("a Market / Region block is produced when regions are paired",
+          bool(rg) and len(rg["members"]) == 2,
+          f"members={[m['name'] for m in (rg or {}).get('members', [])]}")
+    check("each block leads with the Total Market",
+          ch and ch["total"] and ch["total"]["name"] == "TOTAL",
+          f"channel total={ch and ch['total'] and ch['total']['name']}")
+    check("the Total is NOT repeated among the members",
+          all(m["name"] != "TOTAL" for m in (ch["members"] + rg["members"])),
+          f"members={[m['name'] for m in ch['members'] + rg['members']]}")
+    check("a market with no level is still reported, not silently dropped",
+          bool(blocks.get("market_other"))
+          and [m["name"] for m in blocks["market_other"]["members"]] == ["OTHER-1"],
+          f"other={blocks.get('market_other') and [m['name'] for m in blocks['market_other']['members']]}")
+    check("the flat channel_block keeps the Total first, for the exports",
+          rep["channel_block"][0]["name"] == "TOTAL"
+          and len(rep["channel_block"]) == 6,
+          f"first={rep['channel_block'][0]['name']} n={len(rep['channel_block'])}")
+    # A channel's share is of the Total, not of the channel block.
+    c_a = {c["name"]: c for c in ch["members"]}["CH-A"]
+    check("a channel's share is measured against the Total Market",
+          abs(c_a["contribution"]["before_share_pct"] - 30.0) < 1e-9,
+          f"{c_a['contribution']['before_share_pct']}% (want 30 = 30/100)")
+
+    # --- the duplicate grain ------------------------------------------------
+    # A stacked frame: the same manufacturer appears once per period. That is the
+    # structure of the data, not a fault, so the check must NOT report it as
+    # duplicates - while a genuine repeat on the full grain still must.
+    stacked = pd.DataFrame({
+        "CATEGORY": ["C1", "C1", "C1", "C1"],
+        "MANUFACTURER": ["M1", "M1", "M2", "M2"],
+        "BRAND": ["B1", "B1", "B2", "B2"],
+        "Period": ["TY", "YA", "TY", "YA"],
+        "Sales Value": [50.0, np.nan, 30.0, np.nan],
+        "Sales Value YA": [np.nan, 40.0, np.nan, 25.0],
+    })
+    cfg_d = A.AnalysisConfig(
+        a_prior="Sales Value YA", a_current="Sales Value",
+        b_prior="Sales Value YA", b_current="Sales Value",
+        category_col="CATEGORY", manufacturer_col="MANUFACTURER",
+        brand_col="BRAND", period_col="Period",
+    )
+    qc_d = QC.QCReport()
+    QC.check_duplicates(stacked, stacked, cfg_d, qc_d)
+    item = next(c for c in qc_d.checks if c.id == "duplicates")
+    d0 = item.detail["datasets"][0]
+    check("a period-stacked frame is not reported as duplicated",
+          d0["duplicate_rows"] == 0,
+          f"duplicate_rows={d0['duplicate_rows']} "
+          f"(dimension repeats={d0['duplicate_dimension_rows']})")
+    check("the period repeats are reported as structure, not hidden",
+          d0["duplicate_dimension_rows"] == 2
+          and item.status == "PASS"
+          and "stacked workbook" in item.message,
+          f"dim repeats={d0['duplicate_dimension_rows']} status={item.status}")
+
+    # The same key repeating *within* one period is a real duplicate.
+    dup = pd.concat([stacked, stacked.iloc[[0]]], ignore_index=True)
+    qc_d2 = QC.QCReport()
+    QC.check_duplicates(dup, dup, cfg_d, qc_d2)
+    item2 = next(c for c in qc_d2.checks if c.id == "duplicates")
+    d2 = item2.detail["datasets"][0]
+    check("a repeat on the full grain is still flagged",
+          d2["duplicate_rows"] == 1 and item2.status in ("WARN", "FAIL"),
+          f"duplicate_rows={d2['duplicate_rows']} status={item2.status}")
+
+    # --- generalised period vocabulary --------------------------------------
+    # The engine must recognise a translated qualifier AND fall back to position
+    # when it recognises nothing, in both cases ending with two concrete columns.
+    base, var = P.split_metric_name("Umsatz Vorjahr")
+    check("a translated period qualifier is recognised",
+          base == "Umsatz" and var == "YA", f"{base!r} {var!r}")
+    base2, var2 = P.split_metric_name("Marketing Spend 上年")
+    check("a CJK period qualifier is recognised",
+          base2 == "Marketing Spend" and var2 == "YA", f"{base2!r} {var2!r}")
+    prior, current = P.default_period_columns({"SOMETHING": "X", "OTHER": "Y"})
+    check("a family with no recognised qualifier still yields MAT YA + MAT TY",
+          prior == "X" and current == "Y", f"prior={prior!r} current={current!r}")
+    prior3, current3 = P.default_period_columns(
+        {"YA": "Sales Value YA", "VALUE": "Sales Value"})
+    check("a recognised pair resolves to its real columns",
+          prior3 == "Sales Value YA" and current3 == "Sales Value",
+          f"{prior3!r} {current3!r}")
+    # The study reads two periods only. A family carrying 2YA must still resolve
+    # to YA -> VALUE, because 2YA is a third moving-annual window: taking it as
+    # "the prior period" is what made A read B's year-ago column and call the
+    # difference growth.
+    prior4, current4 = P.default_period_columns(
+        {"2YA": "Sales Value 2YA", "YA": "Sales Value YA", "VALUE": "Sales Value"})
+    check("2YA is never chosen as a period slot",
+          prior4 == "Sales Value YA" and current4 == "Sales Value",
+          f"{prior4!r} {current4!r}")
+    prior5, current5 = P.default_period_columns(
+        {"2YA": "Sales Volume 2YA", "YA": "Sales Volume YA", "VALUE": "Sales Volume"})
+    check("a second family resolves the same way",
+          prior5 == "Sales Volume YA" and current5 == "Sales Volume",
+          f"{prior5!r} {current5!r}")
+    # A 2YA-only family genuinely has no year-ago column; reporting that is
+    # correct, and guessing one of the two windows would not be.
+    prior6, current6 = P.default_period_columns({"2YA": "S 2YA", "TY": "S TY"})
+    check("a family with no YA reports no MAT YA rather than borrowing 2YA",
+          prior6 == "" and current6 == "S TY", f"{prior6!r} {current6!r}")
+
+
+# ===========================================================================
+# PART 10 - the Total Market is printed once, at the head of the block
+#
+# A stacked source file carries a Total row *and* the rows it covers. The block
+# therefore leads with the Total Market and lists the members beneath it - and
+# `report["total"]` (the sum over every row of the category) is a superset of
+# both. Printing it again at the foot duplicated the head row and overstated it.
+#
+# Both halves matter: with a baseline the foot row must be gone, and with no
+# baseline it must remain, because there the sum is the only aggregate there is.
+# A test that only checked the first half would be satisfied by deleting the row
+# everywhere - including the case that needs it.
+# ===========================================================================
+
+
+# ===========================================================================
+# PART 11 - the two periods the study reads come from the Period columns
+#
+# The study has exactly two periods: MAT YA and MAT TY. Both are already named
+# in the data - a metric family spells them as a qualifier on the column name
+# (`Sales Value YA` / `Sales Value`) - so a second mapping asking the user to
+# declare them again is redundant, and the default it offered (2YA -> YA) was
+# wrong: 2YA is a third window, and taking it as "the year ago" made dataset A
+# read the column that is actually B's year-ago value, so the report showed a
+# two-year move and labelled it growth.
+#
+# These checks are on the *engine*, not the vocabulary: the columns the analysis
+# ultimately reads are asserted, and with a deliberately wrong wiring, so that a
+# version which recognises the right names but still reads the wrong columns
+# cannot pass.
+# ===========================================================================
+
+
+def part11() -> None:
+    banner("PART 11  MAT YA / MAT TY are resolved from the Period columns")
+
+    # Three moving-annual windows, the shape the reference workbook has, and a
+    # second family spelling its periods differently. The numbers are chosen so
+    # every slot is distinguishable: 2YA / YA / TY are 10 / 20 / 40, so reading
+    # the wrong one changes both the level and the growth.
+    def frame() -> pd.DataFrame:
+        return pd.DataFrame({
+            "CATEGORY": ["C1", "C1", "C1"],
+            "MKT": ["TOTAL"] * 3,
+            "MF": ["M1", "M2", "M3"],
+            "Sales Value 2YA": [3.0, 2.0, 5.0],
+            "Sales Value YA": [10.0, 20.0, 30.0],
+            "Sales Value": [40.0, 25.0, 35.0],
+        })
+
+    def cfg(**kw) -> A.AnalysisConfig:
+        base = dict(
+            metric_label="Sales Value", metric_key="sales_value",
+            a_prior="Sales Value 2YA", a_current="Sales Value YA",
+            b_prior="Sales Value 2YA", b_current="Sales Value YA",
+            category_col="CATEGORY", market_col="MKT",
+            manufacturer_col="MF", markets=["TOTAL"], categories=["C1"],
+        )
+        base.update(kw)
+        return A.AnalysisConfig(**base)
+
+    # --- the columns actually read -----------------------------------------
+    # The wiring is deliberately the *old, wrong* pair: 2YA -> YA. If the
+    # engine reads what it was handed, these fail.
+    c = cfg()
+    notes = A._resolve_period_columns(c, frame(), frame())
+    check("MAT YA is re-pointed at the YA column, not 2YA",
+          c.a_prior == "Sales Value YA" and c.b_prior == "Sales Value YA",
+          f"A={c.a_prior!r} B={c.b_prior!r}")
+    check("MAT TY is re-pointed at the unqualified column",
+          c.a_current == "Sales Value" and c.b_current == "Sales Value",
+          f"A={c.a_current!r} B={c.b_current!r}")
+    check("the correction is reported, not silent",
+          any("MAT YA reads" in n for n in notes) and any("MAT TY reads" in n for n in notes),
+          f"{len(notes)} note(s)")
+
+    # A wiring that is already right must not be churned, and must not warn.
+    c_ok = cfg(a_prior="Sales Value YA", a_current="Sales Value",
+               b_prior="Sales Value YA", b_current="Sales Value")
+    notes_ok = A._resolve_period_columns(c_ok, frame(), frame())
+    check("a correct wiring is left alone and reports nothing",
+          c_ok.a_prior == "Sales Value YA" and c_ok.a_current == "Sales Value"
+          and not notes_ok, f"notes={notes_ok}")
+
+    # --- the numbers the report shows ---------------------------------------
+    # With the wrong wiring fed in, the analysis must still produce the MAT YA ->
+    # MAT TY movement: total 60 -> 100 is +66.67%, not the 2YA -> YA 15 -> 60
+    # (+300%) the raw wiring would have given.
+    prep = A.prepare(frame(), frame(), cfg())
+    rep = A.category_report(prep, "C1")
+    tot = rep["total"]
+    check("the category MAT YA is the sum of the YA column",
+          abs(tot["before_prior"] - 60.0) < 1e-9, f"got {tot['before_prior']}")
+    check("the category MAT TY is the sum of the unqualified column",
+          abs(tot["before_current"] - 100.0) < 1e-9, f"got {tot['before_current']}")
+    check("growth is measured MAT YA -> MAT TY, not 2YA -> YA",
+          abs(tot["before_growth_pct"] - 66.6666666) < 1e-4,
+          f"got {tot['before_growth_pct']:.4f}% (2YA->YA would be +300%)")
+
+    # --- a per-side difference is honoured ----------------------------------
+    # The two datasets are the same measure but may name their periods
+    # differently. B's family drops the unqualified name and spells TY explicitly.
+    b_named = pd.DataFrame({
+        "CATEGORY": ["C1", "C1", "C1"], "MKT": ["TOTAL"] * 3,
+        "MF": ["M1", "M2", "M3"],
+        "Sales Value 2YA": [3.0, 2.0, 5.0],
+        "Sales Value YA": [10.0, 20.0, 30.0],
+        "Sales Value TY": [40.0, 25.0, 35.0],
+    })
+    c2 = cfg()
+    notes2 = A._resolve_period_columns(c2, frame(), b_named)
+    check("B resolves MAT TY from its own TY-suffixed column",
+          c2.b_current == "Sales Value TY", f"B MAT TY = {c2.b_current!r}")
+    check("A is unaffected by B's naming",
+          c2.a_current == "Sales Value", f"A MAT TY = {c2.a_current!r}")
+
+    # --- a family that cannot supply a slot says so -------------------------
+    only_2ya = pd.DataFrame({
+        "CATEGORY": ["C1"], "MKT": ["TOTAL"], "MF": ["M1"],
+        "Sales Value 2YA": [3.0], "Sales Value TY": [40.0],
+    })
+    c3 = cfg(a_prior="Sales Value 2YA", a_current="Sales Value TY",
+             b_prior="Sales Value 2YA", b_current="Sales Value TY")
+    notes3 = A._resolve_period_columns(c3, only_2ya, only_2ya)
+    check("2YA is not borrowed when no YA column exists",
+          c3.a_prior == "" and c3.a_current == "Sales Value TY",
+          f"MAT YA={c3.a_prior!r} MAT TY={c3.a_current!r}")
+    check("the missing MAT YA is explained",
+          any("no MAT YA" in n for n in notes3), f"{len(notes3)} note(s)")
+    # And the engine must not silently present a run with one period: prepare()
+    # reports an empty side rather than using 2YA as a stand-in.
+    prep3 = A.prepare(only_2ya, only_2ya, c3)
+    tot3 = A.category_report(prep3, "C1")["total"]
+    check("with no MAT YA the prior value stays empty, not 2YA",
+          tot3["before_prior"] is None, f"got {tot3['before_prior']}")
+
+    # --- a single-column family is a missing period, not a collapse ----------
+    # One column genuinely cannot supply two periods. The engine must clear the
+    # slot it cannot fill and say so - not leave the incoming value in place
+    # (which would read the same column twice and report 0% growth) and not
+    # borrow a neighbour. The earlier "collapsed pair" note is therefore not the
+    # right report here; the honest one is "this period does not exist".
+    one = pd.DataFrame({
+        "CATEGORY": ["C1"], "MKT": ["TOTAL"], "MF": ["M1"],
+        "Sales Value": [40.0],
+    })
+    c4 = cfg(a_prior="Sales Value", a_current="Sales Value",
+             b_prior="Sales Value", b_current="Sales Value")
+    notes4 = A._resolve_period_columns(c4, one, one)
+    check("a single-column family clears the period it cannot supply",
+          c4.a_prior == "" and c4.a_current == "Sales Value",
+          f"MAT YA={c4.a_prior!r} MAT TY={c4.a_current!r}")
+    check("...and says which period is missing",
+          any("no MAT YA" in n for n in notes4), f"{len(notes4)} note(s)")
+
+    # A two-column family whose prior column is named with a qualifier the
+    # vocabulary does not know: `Spend` (bare, the current period) and
+    # `Spend OP` (unrecognised, left in the base by the splitter). The family is
+    # then a single one-column family, so the honest answer is "no MAT YA" - and
+    # that is what must be reported rather than a positional guess that reads the
+    # same measure twice. This is the case a positional fallback gets wrong, so
+    # it is asserted explicitly.
+    odd = pd.DataFrame({
+        "CATEGORY": ["C1"], "MKT": ["TOTAL"], "MF": ["M1"],
+        "Spend": [100.0], "Spend OP": [40.0],
+    })
+    c5 = A.AnalysisConfig(
+        metric_label="Spend", metric_key="spend",
+        a_prior="", a_current="", b_prior="", b_current="",
+        category_col="CATEGORY", market_col="MKT", manufacturer_col="MF",
+        markets=["TOTAL"], categories=["C1"])
+    notes5 = A._resolve_period_columns(c5, odd, odd)
+    check("an unrecognised qualifier is not treated as MAT YA",
+          c5.a_prior == "" and c5.a_current == "Spend",
+          f"MAT YA={c5.a_prior!r} MAT TY={c5.a_current!r}")
+
+    # With nothing wired at all, the metric the run is about still resolves - the
+    # periods come from the data, so the client does not have to send them.
+    c6 = A.AnalysisConfig(
+        metric_label="Sales Value", metric_key="sales_value",
+        a_prior="", a_current="", b_prior="", b_current="",
+        category_col="CATEGORY", market_col="MKT", manufacturer_col="MF",
+        markets=["TOTAL"], categories=["C1"])
+    notes6 = A._resolve_period_columns(c6, frame(), frame())
+    check("a run with no wired periods still resolves them from the family",
+          c6.a_prior == "Sales Value YA" and c6.a_current == "Sales Value",
+          f"MAT YA={c6.a_prior!r} MAT TY={c6.a_current!r} notes={len(notes6)}")
+
+    # Each side resolves against its OWN frame and its own wired names. A
+    # resolver that passes one side's columns for both frames cannot see B's
+    # family at all and comes back empty - which is the failure this asserts
+    # against, and it is silent rather than loud because the slots simply do not
+    # fill.
+    n_a = pd.DataFrame({"CAT": ["X"], "Sales Value YA": [100.0],
+                        "Sales Value": [110.0]})
+    n_b = pd.DataFrame({"CAT": ["X"], "Value (NT$) YA": [100.0],
+                        "Value (NT$)": [140.0]})
+    check("each side resolves against its own column names",
+          A.resolve_mat_slots("Sales Value YA", "Sales Value",
+                              "Value (NT$) YA", "Value (NT$)",
+                              n_a, n_b, "Sales Value") ==
+          ("Sales Value YA", "Sales Value", "Value (NT$) YA", "Value (NT$)"),
+          str(A.resolve_mat_slots("Sales Value YA", "Sales Value",
+                                  "Value (NT$) YA", "Value (NT$)",
+                                  n_a, n_b, "Sales Value")))
+
+
+# ===========================================================================
+# PART 10 - the Total Market is printed once, at the head of the block
+#
+# A stacked source file carries a Total row *and* the rows it covers. The block
+# therefore leads with the Total Market and lists the members beneath it - and
+# `report["total"]` (the sum over every row of the category) is a superset of
+# both. Printing it again at the foot duplicated the head row and overstated it.
+#
+# Both halves matter: with a baseline the foot row must be gone, and with no
+# baseline it must remain, because there the sum is the only aggregate there is.
+# A test that only checked the first half would be satisfied by deleting the row
+# everywhere - including the case that needs it.
+# ===========================================================================
+
+
+def part10() -> None:
+    banner("PART 10  the Total Market appears once, and only where it belongs")
+
+    import openpyxl
+    from pptx import Presentation
+
+    df = pd.DataFrame({
+        "CATEGORY": ["C1"] * 4,
+        "MKT": ["TOTAL", "CH-A", "CH-B", "RG-N"],
+        "Sales Value YA": [90.0, 27.0, 18.0, 20.0],
+        "Sales Value": [100.0, 30.0, 20.0, 24.0],
+    })
+    common = dict(
+        a_prior="Sales Value YA", a_current="Sales Value",
+        b_prior="Sales Value YA", b_current="Sales Value",
+        category_col="CATEGORY", market_col="MKT",
+        markets=["TOTAL", "CH-A", "CH-B", "RG-N"],
+        market_levels={"TOTAL": "total", "CH-A": "channel",
+                       "CH-B": "channel", "RG-N": "region"},
+    )
+
+    def run(baseline: str, tag: str):
+        cfg = A.AnalysisConfig(baseline_market=baseline, **common)
+        rep = A.category_report(A.prepare(df, df, cfg), "C1")
+        qc = QC.run_qc([rep], cfg, df, df, mapping_results={})
+        d = os.path.join(OUT, tag)
+        os.makedirs(d, exist_ok=True)
+        xp = os.path.join(d, "C1_Impact.xlsx")
+        pp = os.path.join(d, "C1_Impact.pptx")
+        export_excel.build_category_workbook(rep, qc.to_dict(), xp)
+        export_pptx.build_category_deck(rep, qc.to_dict(), pp)
+        return rep, xp, pp
+
+    # --- with a Total Market designated ------------------------------------
+    rep, xp, pp = run("TOTAL", "p10_with_baseline")
+    check("the report knows the Total Market baseline",
+          (rep.get("baseline") or {}).get("name") == "TOTAL",
+          f"baseline={(rep.get('baseline') or {}).get('name')!r}")
+
+    ws = openpyxl.load_workbook(xp)["Channel Block"]
+    rows = [r for r in ws.iter_rows(values_only=True) if r and r[0]]
+    labels = [r[0] for r in rows]
+    head = next((r for r in rows
+                 if isinstance(r[0], str) and r[0].startswith("Total Market")), None)
+    tails = [r[0] for r in rows
+             if isinstance(r[0], str) and r[0].strip().startswith("Total")]
+    check("Excel leads the block with the Total Market",
+          head is not None and "TOTAL" in str(head[0]),
+          f"head={head and head[0]!r}")
+    check("Excel appends no second Total when a Total Market leads the block",
+          not [t for t in tails if t.strip() == "Total"],
+          f"row labels={labels}")
+    if head is not None:
+        # The head value must be the baseline itself, not the wider category sum.
+        # The writer scales its figures, so re-derive the same scale from the
+        # report's own magnitudes rather than guessing from the cell value.
+        cb = rep["channel_block"]
+        _scale, _unit = export_excel._scale_of(
+            *[b["after"]["mat_ty"] for b in cb],
+            *[b["before"]["mat_ty"] for b in cb])
+        head_v = (head[2] or 0.0) * (_scale or 1.0)
+        base_v = rep["baseline"]["before"]
+        total_v = rep["total"]["before_current"]
+        check("the head row equals the Total Market, not the category sum",
+              base_v is not None and abs(head_v - base_v) <= max(abs(base_v), 1) * 1e-6,
+              f"cell={head[2]}x{_scale or 1} = {head_v} baseline={base_v} "
+              f"category_sum={total_v}")
+        # And the sum must genuinely differ, or the check above proves nothing.
+        check("the category sum really is wider than the Total Market",
+              total_v is not None and abs(total_v - base_v) > 1e-9,
+              f"category_sum={total_v} vs baseline={base_v}")
+
+    prs = Presentation(pp)
+    ls_tables = []
+    for sl in prs.slides:
+        for sh in sl.shapes:
+            if not sh.has_table:
+                continue
+            hdr = [c.text for c in sh.table.rows[0].cells]
+            if hdr and hdr[0] in ("Channel", "Top channel (by TY)"):
+                ls_tables.append(sh.table)
+    check("the deck has a channel/level-shift table to inspect",
+          len(ls_tables) >= 1, f"{len(ls_tables)} table(s)")
+    deck_first = [t.rows[1].cells[0].text.strip() for t in ls_tables if len(t.rows) > 1]
+    # python-pptx rows do not accept negative indices.
+    deck_last = [t.rows[len(t.rows) - 1].cells[0].text.strip() for t in ls_tables]
+    # The deck writes the market name verbatim (the Excel decorates it as
+    # "Total Market · X"), so match against the baseline name itself.
+    base_label = (rep.get("baseline") or {}).get("name") or ""
+    check("the deck leads its table with the Total Market",
+          bool(base_label) and any(t == base_label for t in deck_first),
+          f"baseline={base_label!r} first rows={deck_first}")
+    check("the deck appends no second Total row",
+          not [t for t in deck_last if t == "Total"],
+          f"last rows={deck_last}")
+
+    # --- with no Total Market designated ------------------------------------
+    rep2, xp2, _ = run("", "p10_no_baseline")
+    check("with no baseline the report says so",
+          not (rep2.get("baseline") or {}).get("name"),
+          f"baseline={(rep2.get('baseline') or {}).get('name')!r}")
+    ws2 = openpyxl.load_workbook(xp2)["Channel Block"]
+    rows2 = [r for r in ws2.iter_rows(values_only=True) if r and r[0]]
+    sums = [r[0] for r in rows2
+            if isinstance(r[0], str) and r[0].strip().startswith("Total (")]
+    check("with no Total Market the foot row survives, labelled as a sum",
+          len(sums) == 1, f"sum rows={sums}")
+    # And it must be the sum the report computed - the only aggregate available.
+    if len(sums) == 1:
+        cell = next(r for r in rows2 if r[0] == sums[0])
+        cb2 = rep2["channel_block"]
+        _s2, _u2 = export_excel._scale_of(
+            *[b["after"]["mat_ty"] for b in cb2],
+            *[b["before"]["mat_ty"] for b in cb2])
+        v = (cell[2] or 0.0) * (_s2 or 1.0)
+        want = rep2["total"]["before_current"]
+        check("the foot row carries the category sum",
+              want is not None and abs(v - want) <= max(abs(want), 1) * 1e-6,
+              f"cell={cell[2]}x{_s2 or 1} = {v} report_total={want}")
+
+
+# ===========================================================================
 
 
 def main() -> int:
@@ -1528,6 +1988,9 @@ def main() -> int:
     part6()
     part7()
     part8()
+    part9()
+    part10()
+    part11()
     banner("SUMMARY")
     n_pass = sum(1 for _, s, _ in results if s == PASS)
     n_fail = len(results) - n_pass

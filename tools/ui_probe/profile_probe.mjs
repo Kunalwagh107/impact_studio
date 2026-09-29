@@ -56,8 +56,25 @@ console.log(' PROFILE PROBE - Current_MAT (the reported screenshot)')
 console.log('='.repeat(74))
 await send('Page.navigate', { url: APP }); await sleep(3500)
 
-await setInp('#path-input', WB)
-await click('#btn-path')
+// Step 1 is upload-first now: feed the workbook through the hidden #file-input,
+// then #btn-upload. There is no #path-input / #btn-path any more. The bytes are
+// fetched from /__workbook/ - an empty File uploads 0 bytes and every later read
+// 500s, which looks like a broken control rather than a broken probe.
+console.log('upload:', await ev(`(async () => {
+  const el = document.querySelector('#file-input')
+  if (!el) return 'NOT_FOUND'
+  const name = ${JSON.stringify(WB)}.split(/[\\\\/]/).pop()
+  const r = await fetch('/__workbook/' + encodeURIComponent(name), { cache: 'no-store' })
+  if (!r.ok) return 'fetch ' + r.status
+  const buf = await r.arrayBuffer()
+  if (!buf || buf.byteLength === 0) return 'served 0 bytes'
+  const dt = new DataTransfer()
+  dt.items.add(new File([buf], name, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
+  el.files = dt.files
+  el.dispatchEvent(new Event('change', { bubbles: true }))
+  return 'ok:' + buf.byteLength
+})()`))
+await click('#btn-upload')
 await sleep(4500)
 const sid = await ev(`[...document.querySelector('#a-source').options].map(o=>o.value).filter(Boolean).pop()`)
 

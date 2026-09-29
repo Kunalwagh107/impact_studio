@@ -38,11 +38,31 @@ htmlcov/
 tools/ui_probe/shots*/
 tools/ui_probe/*.log
 
+# Probe run output: server logs, probe stdout, screenshots, and the headless
+# Chrome profile. ~92 MB after a single full run, all of it regenerable.
+tools/ui_probe/_run/
+tools/ui_probe/_run*/
+
+# A stray nested tree produced by running a probe whose script `cd`s to its own
+# directory: `tools/ui_probe/tools/ui_probe/`. Not source.
+tools/ui_probe/tools/
+
 # Headless-Chrome profiles created by the probes. These are large, machine
 # specific, and contain browser state.
 chrome-probe/
 chromeprof*/
 .tmp_chrome*/
+chrome-profile/
+_*/chrome-profile/
+
+# Interpreter caches (in addition to __pycache__, which is above)
+.ruff_cache/
+.pytest_cache/
+
+# A scratch duplicate of the reference workbook created by Explorer "Copy".
+# 28 MB, not read by anything.
+TW Impact Study_V2 1 (1) - Copy.xlsx
+* - Copy.xlsx
 
 # Local environment / secrets
 .env

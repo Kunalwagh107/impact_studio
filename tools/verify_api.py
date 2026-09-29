@@ -229,28 +229,51 @@ def main() -> int:
           f"{n_mapped} of {len(authored)} categories")
     mapping_a = {"market": {}}  # market is paired separately now
 
-    # --- 3d. pre-flight: an unmapped metric must be refused -----------------
+    # --- 3d. pre-flight: a metric that cannot resolve must be refused --------
+    # The periods now come from the Metric Period columns, so "the client sent
+    # nothing" is no longer a failure - the server resolves MAT YA and MAT TY
+    # itself, which is the point of the change. What must still be refused is a
+    # metric the data cannot supply a period pair for: a family that is not in
+    # the frame at all. That is the genuine unusable wiring, and testing it is
+    # what keeps the guard honest now that blank is recoverable.
     bad = {
         "a": A, "b": B,
         "dim_col_a": dim_col_a, "dim_col_b": dim_col_b,
-        "metric_label": "Sales Value",
-        "a_prior": "Sales Value YA", "a_current": "Sales Value",
-        "b_prior": "", "b_current": "",            # deliberately unmapped
+        "metric_label": "Nonexistent Measure",
+        "a_prior": "No Such Measure YA", "a_current": "No Such Measure",
+        "b_prior": "No Such Measure YA", "b_current": "No Such Measure",
         "is_rate": False, "markets": [], "categories": ["BEER"], "top_n": 10,
         "client_brands": [], "mapping_a": {}, "mapping_b": {},
         "trend_enabled": False,
     }
     try:
         post(base, "/api/run", bad, timeout=300)
-        check("unmapped metric is refused with a clear error", False,
-              "run was accepted with blank metric columns")
+        check("a metric the data cannot supply is refused with a clear error", False,
+              "run was accepted for a metric that is not in either dataset")
     except urllib.error.HTTPError as e:
         detail = json.loads(e.read().decode()).get("detail", {})
-        check("unmapped metric is refused with a clear error", e.code == 400,
+        check("a metric the data cannot supply is refused with a clear error",
+              e.code == 400,
               f"HTTP {e.code} · {detail.get('error')}")
         check("the error names the offending columns",
               len(detail.get("problems", [])) >= 2,
               " | ".join(detail.get("problems", []))[:120])
+
+    # And the blank wiring that used to be an error is now *resolved*, not
+    # refused: the server fills both periods from the family. Asserting that is
+    # what stops the guard above from being satisfied by refusing everything.
+    recoverable = dict(bad)
+    recoverable.update({
+        "metric_label": "Sales Value",
+        "a_prior": "", "a_current": "", "b_prior": "", "b_current": "",
+    })
+    try:
+        d_ok = post(base, "/api/run", recoverable, timeout=300)
+        check("blank period wiring is resolved from the data, not refused",
+              bool(d_ok.get("reports")), f"{len(d_ok.get('reports', []))} report(s)")
+    except urllib.error.HTTPError as e:
+        check("blank period wiring is resolved from the data, not refused", False,
+              f"HTTP {e.code} · {e.read().decode()[:160]}")
 
     # --- 4. choose categories ----------------------------------------------
     cat_vals = [r["source"] for r in cm["rows"]]
@@ -289,9 +312,13 @@ def main() -> int:
     check("no QC failures", run["qc"]["worst"] != "FAIL")
 
     r0 = run["reports"][0]
+    # Brand value share was removed on request, so `brand_block` is deliberately
+    # absent; the channel block, the Top-N and the client tracker remain.
     check("first report has all blocks",
-          bool(r0.get("channel_block")) and bool(r0.get("brand_block"))
+          bool(r0.get("channel_block"))
           and bool(r0.get("manufacturer_top_n")) and bool(r0.get("client_brands")))
+    check("brand value share removed", "brand_block" not in r0,
+          f"keys: {sorted(k for k in r0 if 'brand' in k)}")
     print(f"        {r0['category']}: before {r0['total']['before_current']:,.0f} "
           f"-> after {r0['total']['after_current']:,.0f}  "
           f"level shift {r0['total']['level_shift_pp']:+.2f}pp")

@@ -66,24 +66,34 @@ def main() -> int:
 
     # step 3 — market pairing. The user authors the pairings; the server only
     # enumerates the values on each side and reports hierarchy evidence.
+    #
+    # The reference workbook carries one Total plus three channels and no
+    # regions, so the demo pairs all four: the Total (level `total`) and the
+    # three channels beneath it. That is what exercises the split market blocks -
+    # the Total leads the Channel block and is not repeated among its members.
     TOTAL_A = "TW Total TW Offline (G)"
+    CHANNELS_A = ["TW CVS", "TW Chain Super-PX MART", "TW Personal Care Store"]
+    pairs = ([{"market_a": TOTAL_A, "market_b": TOTAL_A, "level": "total"}]
+             + [{"market_a": c, "market_b": c, "level": "channel"}
+                for c in CHANNELS_A])
     mk = post(args.base, "/api/market-mapping", {
         "a": A, "b": B,
         "market_col_a": "Display Market Name", "market_col_b": "Display Market Name",
         "metric_col_a": "Sales Value", "metric_col_b": "Sales Value",
-        "pairs": [{"market_a": TOTAL_A, "market_b": TOTAL_A, "level": "total"}],
+        "pairs": pairs,
     }, timeout=1800)
     ms = mk["summary"]
     print(f"market      : A {ms['n_a_values']} values / B {ms['n_b_values']} values"
           f" | {ms['n_pairs']} pairing(s) authored"
+          f" | {ms['n_total']} total / {ms['n_region']} region / {ms['n_channel']} channel"
           f" | hierarchy {mk.get('paths_used')}")
-    market_pairs = [{"market_a": TOTAL_A, "market_b": TOTAL_A, "level": "total"}]
+    market_pairs = pairs
     # The dimension map is nested: dimension -> {A value: B value}. The market
     # pairing is the only dimension mapping now; B's own map is the identity,
     # because B already carries the target name. A flat {value: value} map is
     # rejected by the request model (dict[str, dict[str, str]]).
-    mapping_a = {"market": {TOTAL_A: TOTAL_A}}
-    mapping_b = {"market": {TOTAL_A: TOTAL_A}}
+    mapping_a = {"market": {p["market_a"]: p["market_b"] for p in pairs}}
+    mapping_b = {"market": {p["market_b"]: p["market_b"] for p in pairs}}
 
     # step 4 — category enumeration. Nothing is decided for the user; this demo
     # authors identity rows because the reference workbook is already harmonised.
@@ -136,8 +146,8 @@ def main() -> int:
         "a_prior": "Sales Value YA", "a_current": "Sales Value",
         "b_prior": "Sales Value YA", "b_current": "Sales Value",
         "is_rate": False, "weight_metric_a": "", "weight_metric_b": "",
-        "markets": [TOTAL_A], "market_pairs": market_pairs,
-        "market_level": "total", "baseline_market": TOTAL_A,
+        "markets": [p["market_a"] for p in pairs], "market_pairs": market_pairs,
+        "market_level": "all", "baseline_market": TOTAL_A,
         "categories": cats, "top_n": 10,
         "client_brands": ["WEIDER", "CENTRUM", "BLACKMORES", "DHC"],
         "mapping_a": mapping_a, "mapping_b": mapping_b,

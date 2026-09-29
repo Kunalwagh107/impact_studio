@@ -193,17 +193,31 @@ async function onSourceChange(side) {
   await refreshColumns(side);
 }
 
+// Per-side request token for the column read. Choosing a source fires a read for
+// the panel's *default* sheet, and choosing a sheet fires a second one; the two
+// can resolve out of order, and the older response then repaints `#side-splitcol`
+// with the wrong sheet's columns (measured: `Formula`'s 4 options landing after
+// `Raw_MAT`'s 16, leaving the split column unsettable). Bumping the token on
+// every call and discarding any response whose token is no longer current makes
+// the newest request the only one that can write.
+if (!S.colToken) S.colToken = {};
+
 async function refreshColumns(side) {
   const sid = $(`#${side}-source`).value;
   if (!sid) return;
   const sheet = $(`#${side}-sheet`).value || null;
   const hr = Number($(`#${side}-header`).value) || 1;
+  const token = (S.colToken[side] || 0) + 1;
+  S.colToken[side] = token;
   overlay(true, 'Reading columns…');
   try {
     const q = new URLSearchParams();
     if (sheet) q.set('sheet', sheet);
     q.set('header_row', hr);
     const d = await api(`/api/source/${sid}/columns?${q}`);
+    // A later request has already been issued - this answer is stale, so drop it
+    // rather than overwriting the panel with a sheet the user has moved off.
+    if (S.colToken[side] !== token) return;
     const splitSel = $(`#${side}-splitcol`);
     const cur = splitSel.value;
     splitSel.innerHTML = '<option value="">— none —</option>' +
@@ -230,8 +244,13 @@ async function refreshColumns(side) {
       `<b>First cols:</b> ${d.columns.slice(0, 6).map(esc).join(', ')}`);
     $(`#${side}-summary`).innerHTML = summary.join('\n');
   } catch (e) {
+    if (S.colToken[side] !== token) return;
     $(`#${side}-summary`).textContent = 'Error: ' + e.message;
-  } finally { overlay(false); }
+  } finally {
+    // A superseded call must not lift the overlay while the current read is
+    // still in flight, or the panel looks finished while it is still loading.
+    if (S.colToken[side] === token) overlay(false);
+  }
 }
 
 async function onSplitChange(side) {
@@ -715,15 +734,21 @@ function renderMarketPairing() {
 // against and reporting it would present a one-sided number as an impact.
 // ---------------------------------------------------------------------------
 
-/** Pick a sensible metric column on one side, for the values shown as evidence. */
+/** Pick a sensible metric column on one side, for the values shown as evidence.
+ *
+ * "Sensible" means the *current-period column of the value metric*, resolved the
+ * same generalised way the analysis resolves it - never a hardcoded "VALUE"/"TY"
+ * key, which does not exist in a workbook whose periods are named differently.
+ */
 function pickMetricCol(side, preferFamily) {
   const fams = S.profile?.[side]?.metric_families || {};
   let fam = preferFamily && fams[preferFamily] ? preferFamily
-    : Object.keys(fams).find(f => /sales value/i.test(f))
+    : Object.keys(fams).find(f => metricDefFor(f)?.key === 'sales_value')
     || Object.keys(fams)[0];
   if (!fam) return '';
   const variants = fams[fam] || {};
-  return variants.VALUE || variants.TY || Object.values(variants)[0] || '';
+  return variants[defaultVariant(variants, 'current')]
+    || Object.values(variants)[0] || '';
 }
 
 async function doCategoryMapping(metricOverride) {
@@ -1226,12 +1251,19 @@ function buildMappings() {
 // ND is special: it is a *distribution level*, not an accumulating quantity, so
 // a percentage growth of it is not a meaningful impact measure. It is reported
 // as Top / TY / YA / absolute change (TY - YA) and carries no growth at all.
+//
+// Period selects hold variant **keys** (`YA`, `VALUE`, and whatever token this
+// workbook uses), and the request must carry the real **column names** the
+// family maps them to. Every select resolves through the family, so a workbook
+// whose period names are translated - or which has no recognisable qualifier at
+// all - works unchanged: the options are whatever the profile actually found,
+// and the analysis reads only the two concrete columns the selects resolve to.
 // ---------------------------------------------------------------------------
 const METRIC_DEFS = [
   {
     key: 'sales_value',
     label: 'Sales Value',
-    match: /sales?\s*value/i,
+    match: /sales?\s*value|\bvalue\b|umsatz|revenue|turnover/i,
     is_rate: false,
     growth_applicable: true,
     hint: 'Value. Growth, level shift and contribution.',
@@ -1239,7 +1271,7 @@ const METRIC_DEFS = [
   {
     key: 'volume',
     label: 'Volume',
-    match: /\bvolume\b|\bunits?\b|\bqty\b|\bquantity\b/i,
+    match: /\bvolume\b|\bunits?\b|\bqty\b|\bquantity\b|menge|absatz/i,
     is_rate: false,
     growth_applicable: true,
     hint: 'Units / volume. Growth, level shift and contribution.',
@@ -1247,7 +1279,7 @@ const METRIC_DEFS = [
   {
     key: 'nd',
     label: 'Numeric Distribution (ND)',
-    match: /\bnd\b|numeric\s*distribution|\bdist\b|distribution/i,
+    match: /\bnd\b|numeric\s*distribution|\bdist\b|distribution|distribution/i,
     is_rate: true,
     growth_applicable: false,
     hint: 'Distribution level. Top / TY / YA / absolute change — no growth.',
@@ -1290,16 +1322,27 @@ function buildSelectionUI() {
   // metric is not wired" even though it is.
   validateMetricWiring();
 
-  // markets — the values the user paired in step 3, at the level they chose.
-  // The scope is their decision, so it is read back from the pairings rather
-  // than recomputed; the chips let them narrow it further for this run.
+  // markets — every value the user paired in step 3, plus what the level implies.
+  //
+  // This used to list only the pairings whose level equalled `S.marketLevel`, so
+  // choosing "Channels" in step 3 dropped every region and every total from the
+  // step-5 chip list - which read as "I am not getting all the markets". The
+  // chip list is the *available* set; the level decides which of them the run
+  // defaults to. Showing all of them and pre-selecting the level's members is
+  // both more honest and more useful, since a run may legitimately want a total
+  // alongside the channels beneath it.
   const pairs = S.marketPairs || [];
   const lvl = S.marketLevel || 'total';
-  const atLevel = pairs.filter(p => lvl === 'all' || p.level === lvl).map(p => p.market_a).filter(Boolean);
-  const canon = atLevel.length ? atLevel
-    : pairs.map(p => p.market_a).filter(Boolean);
-  const scope = canon;
-  $('#c-markets').innerHTML = canon.map(v =>
+  const allPaired = Array.from(new Set(pairs.map(p => p.market_a).filter(Boolean)));
+  const atLevel = pairs
+    .filter(p => lvl === 'all' || p.level === lvl)
+    .map(p => p.market_a)
+    .filter(Boolean);
+  // Pre-select the level's members; when a level has no pairings, fall back to
+  // showing none selected rather than silently selecting everything, so the
+  // empty case is visible instead of looking like a full selection.
+  const scope = lvl === 'all' ? allPaired : Array.from(new Set(atLevel));
+  $('#c-markets').innerHTML = allPaired.map(v =>
     `<span class="chip ${scope.includes(v) ? 'on' : ''}" data-market="${esc(v)}">${esc(v)}</span>`).join('')
     || '<span class="hint">No market dimension detected.</span>';
   S.selection.markets = scope;
@@ -1436,9 +1479,18 @@ function renderMetricWiring(famsA, famsB) {
 }
 
 /**
- * Period selects, one block per selected metric. Every metric gets its own
- * prior/current pair on each side, because the same metric family can expose a
- * different set of periods on the two datasets.
+ * The two periods the study reads, shown per metric.
+ *
+ * This is a **report, not a question**. MAT YA and MAT TY are already in the
+ * data: the metric family carries them as a period qualifier on the column name
+ * (`Sales Value YA` is MAT YA; the unqualified `Sales Value` is MAT TY), and the
+ * fact table's own `Periods` column says the same thing. Asking the user to name
+ * them again invited a second answer that could disagree with the first, and the
+ * default it offered (2YA -> YA) landed on a column one window too far back - so
+ * A read B's year-ago column and the report called the difference growth.
+ *
+ * The server resolves both slots from the family and rewrites the wiring, so
+ * there is nothing to choose here. What is shown is what the run will read.
  */
 function renderMetricPeriods() {
   const box = $('#c-periods');
@@ -1448,49 +1500,73 @@ function renderMetricPeriods() {
     box.innerHTML = '<p class="hint">Select at least one metric.</p>';
     return;
   }
+  // The two slots the study reads, and the family variant that names each. The
+  // variant key is what the request carries; the column is what the user sees,
+  // because the column is the thing they can check against their workbook.
+  const SLOTS = [
+    { role: 'MAT YA', want: 'prior', variants: ['YA'], label: 'Year ago' },
+    { role: 'MAT TY', want: 'current', variants: ['VALUE', 'TY'], label: 'This year' },
+  ];
   box.innerHTML = sel.map(def => {
     const wires = resolveWiring(def);
     const fa = S.profile.a.metric_families?.[wires.family_a] || {};
     const fb = S.profile.b.metric_families?.[wires.family_b] || {};
-    const cur = S.metricWiring?.[def.key] || {};
+    const rows = SLOTS.map(slot => {
+      const colA = slot.variants.map(v => fa[v]).find(Boolean) || '';
+      const colB = slot.variants.map(v => fb[v]).find(Boolean) || colA;
+      const cell = c => c
+        ? `<code>${esc(c)}</code>`
+        : '<span class="tag warn">not in this workbook</span>';
+      return `<tr>
+        <td><b>${esc(slot.role)}</b><div class="hint">${esc(slot.label)}</div></td>
+        <td>${cell(colA)}</td><td>${cell(colB)}</td>
+      </tr>`;
+    }).join('');
     return `<div class="wire-card">
       <div class="wire-head">${esc(def.label)}
         ${def.is_rate ? '<span class="tag warn">no growth</span>' : ''}</div>
-      <div class="grid two tight">
-        <div class="field" style="margin:0"><label>A · prior period</label>
-          <select data-per="a_prior" data-key="${def.key}">${periodOpts(fa, cur.a_prior, 'YA')}</select></div>
-        <div class="field" style="margin:0"><label>A · current period</label>
-          <select data-per="a_current" data-key="${def.key}">${periodOpts(fa, cur.a_current, 'VALUE')}</select></div>
-        <div class="field" style="margin:0"><label>B · prior period</label>
-          <select data-per="b_prior" data-key="${def.key}">${periodOpts(fb, cur.b_prior, 'YA')}</select></div>
-        <div class="field" style="margin:0"><label>B · current period</label>
-          <select data-per="b_current" data-key="${def.key}">${periodOpts(fb, cur.b_current, 'VALUE')}</select></div>
-      </div>
+      <p class="hint" style="margin:2px 0 8px">Read from the Period columns — the
+         qualifier in the metric header names each period, so there is nothing to
+         map here. <b>2YA</b> is not part of the study and is never read.</p>
+      <table class="mini" style="width:100%"><thead><tr>
+        <th style="width:34%">Period</th>
+        <th>${esc(S.profile.a.label || 'Previous dataset')}</th>
+        <th>${esc(S.profile.b.label || 'Updated dataset')}</th>
+      </tr></thead><tbody>${rows}</tbody></table>
     </div>`;
   }).join('');
-
-  $$('#c-periods [data-per]').forEach(el => {
-    el.onchange = () => {
-      const key = el.dataset.key;
-      S.metricWiring = S.metricWiring || {};
-      S.metricWiring[key] = { ...(S.metricWiring[key] || {}), [el.dataset.per]: el.value };
-      validateMetricWiring();
-    };
-  });
 }
 
-/** <option> list for one side's period variants, preferring the usual default. */
-function periodOpts(obj, chosen, preferred) {
-  const order = { '2YA': 0, 'YA': 1, 'VALUE': 2, 'TY': 3 };
-  const variants = Object.keys(obj || {}).sort((x, y) => (order[x] ?? 9) - (order[y] ?? 9));
-  if (!variants.length) return '<option value="">— not available —</option>';
-  const def = obj[preferred] || obj[variants[0]];
-  return variants.map(v => {
-    const sel = chosen !== undefined && chosen !== null && chosen !== ''
-      ? v === chosen
-      : obj[v] === def;
-    return `<option value="${esc(v)}" ${sel ? 'selected' : ''}>${esc(v)} · ${esc(obj[v])}</option>`;
-  }).join('');
+/**
+ * The recognised period classes, earliest first. Mirrors the backend's
+ * ``profiling.QUALIFIER_TOKENS``, and is used for *ordering and defaulting only*
+ * - the variants themselves are always the ones the profile actually found, so a
+ * workbook with translated or unrecognised period names still works.
+ */
+const VARIANT_ORDER = ['2YA', 'YA', 'TY', 'VALUE'];
+const PRIOR_VARIANTS = ['2YA', 'YA'];
+const CURRENT_VARIANTS = ['VALUE', 'TY'];
+
+/**
+ * The variant key a family should default to for the prior / current period.
+ *
+ * Retained for the paths that need "a sensible column from this family" rather
+ * than a named period slot (the category-mapping preview and the rate-weight
+ * default). The study's own MAT YA / MAT TY slots do **not** come through here -
+ * `buildMetricBlocks` resolves them itself so `2YA` can be excluded, which
+ * ``PRIOR_VARIANTS`` includes.
+ */
+function defaultVariant(obj, want) {
+  const keys = Object.keys(obj || {});
+  if (!keys.length) return '';
+  const list = want === 'prior' ? PRIOR_VARIANTS : CURRENT_VARIANTS;
+  const hit = list.find(v => keys.includes(v));
+  if (hit) return hit;
+  // No recognised class (a translated or absent qualifier): fall back to
+  // position, with the later variant as the current period.
+  const ordered = keys.slice().sort(
+    (x, y) => (VARIANT_ORDER.indexOf(x) + 1 || 99) - (VARIANT_ORDER.indexOf(y) + 1 || 99));
+  return want === 'prior' ? (ordered[0] || '') : (ordered[ordered.length - 1] || '');
 }
 
 /** Resolve a metric definition to its two family names, honouring any override. */
@@ -1504,8 +1580,13 @@ function resolveWiring(def) {
 }
 
 /**
- * Turn the selected metrics into the request blocks, reading the period selects
- * and the per-side weight columns.
+ * Turn the selected metrics into the request blocks, reading the periods from
+ * the family and the per-side weight columns.
+ *
+ * The period **slots** are fixed by the study - MAT YA and MAT TY - and each is
+ * named by a variant of the metric family the profile found. There is no longer
+ * a select to read: the request derives the two columns itself, so the only
+ * possible answer is the one the period qualifier gives.
  */
 function buildMetricBlocks() {
   const out = [];
@@ -1514,30 +1595,40 @@ function buildMetricBlocks() {
     const w = resolveWiring(def);
     const fa = S.profile.a.metric_families?.[w.family_a] || {};
     const fb = S.profile.b.metric_families?.[w.family_b] || {};
-    // A period select's value is a *variant key* within the family (`YA`,
-    // `VALUE`, `2YA`), while the analysis needs the real column name the family
-    // maps it to (`Sales Value YA`). Sending the bare key made the server reject
-    // the run with "column 'YA' ... does not exist", so translate here. The
-    // fallbacks are already column names, hence the || inside the lookup.
-    const col = (fam, key) => (key && fam?.[key]) || key || '';
-    const a_prior = col(fa, $(`[data-per="a_prior"][data-key="${def.key}"]`)?.value
-      || w.a_prior || 'YA');
-    const a_current = col(fa, $(`[data-per="a_current"][data-key="${def.key}"]`)?.value
-      || w.a_current || 'VALUE');
-    // B may name its periods differently, so resolve against B's family and only
-    // fall back to A's real column when B has no such variant at all.
-    const b_prior_key = $(`[data-per="b_prior"][data-key="${def.key}"]`)?.value
-      || w.b_prior || 'YA';
-    const b_current_key = $(`[data-per="b_current"][data-key="${def.key}"]`)?.value
-      || w.b_current || 'VALUE';
-    const b_prior = fb[b_prior_key] || col(fa, b_prior_key);
-    const b_current = fb[b_current_key] || col(fa, b_current_key);
+    // MAT YA is named by the `YA` variant; MAT TY by the unqualified measure
+    // (`VALUE`), falling back to an explicit `TY`. A family that spells both
+    // differently still resolves: `matSlot` walks the family's own variants
+    // before giving up, so a translated or unqualified workbook keeps working.
+    //
+    // `2YA` is excluded by construction - it is a third moving-annual window
+    // the study does not use, and including it here is what previously made the
+    // "year ago" slot read a column two years back.
+    const matSlot = (fam, want) => {
+      const keys = Object.keys(fam || {});
+      if (!keys.length) return { key: '', col: '' };
+      const preferred = want === 'ya' ? ['YA'] : ['VALUE', 'TY'];
+      let key = preferred.find(v => keys.includes(v));
+      if (!key) {
+        // No recognised qualifier: order the variants and take an end, with the
+        // later one as MAT TY. 2YA never participates.
+        const ordered = keys.filter(k => k !== '2YA').sort(
+          (x, y) => (VARIANT_ORDER.indexOf(x) + 1 || 99) - (VARIANT_ORDER.indexOf(y) + 1 || 99));
+        key = want === 'ya' ? (ordered[0] || '') : (ordered[ordered.length - 1] || '');
+      }
+      return { key, col: (key && fam[key]) || '' };
+    };
+
+    // A and B name their periods independently; B falls back to A's column only
+    // when its own family cannot supply the slot at all.
+    const yaA = matSlot(fa, 'ya'), tyA = matSlot(fa, 'ty');
+    const yaB = matSlot(fb, 'ya'), tyB = matSlot(fb, 'ty');
     out.push({
       key: def.key,
       label: def.label,
       family_a: w.family_a || '',
       family_b: w.family_b || '',
-      a_prior, a_current, b_prior, b_current,
+      a_prior: yaA.col, a_current: tyA.col,
+      b_prior: yaB.col || yaA.col, b_current: tyB.col || tyA.col,
       is_rate: def.is_rate,
       growth_applicable: def.growth_applicable,
       weight_metric_a: def.is_rate ? (w.weight_a || defaultWeight('a')) : '',
@@ -1552,14 +1643,16 @@ function buildMetricBlocks() {
  *
  * The server validates this against the real columns, so returning the family
  * name (e.g. "Sales Value") fails when the column is named "Sales Value 2YA" or
- * the family carries several periods. Prefer the family's current-period column.
+ * the family carries several periods. Prefer the family's current-period column,
+ * resolved from the variants the profile actually found rather than from a
+ * hardcoded "VALUE"/"TY" key.
  */
 function defaultWeight(side) {
   const fams = S.profile[side]?.metric_families || {};
-  const name = Object.keys(fams).find(f => /sales?\s*value/i.test(f))
+  const name = Object.keys(fams).find(f => metricDefFor(f)?.key === 'sales_value')
     || Object.keys(fams)[0] || '';
   const fam = fams[name] || {};
-  return fam.VALUE || fam.TY || Object.values(fam)[0] || '';
+  return fam[defaultVariant(fam, 'current')] || Object.values(fam)[0] || '';
 }
 
 /**
@@ -1592,10 +1685,12 @@ function validateMetricWiring() {
   };
   const colsA = knownCols('a'), colsB = knownCols('b');
   blocks.forEach(b => {
-    [['A · prior period', b.a_prior, colsA], ['A · current period', b.a_current, colsA],
-     ['B · prior period', b.b_prior, colsB], ['B · current period', b.b_current, colsB]]
+    [['MAT YA (year ago)', b.a_prior, colsA],
+     ['MAT TY (this year)', b.a_current, colsA],
+     ['MAT YA (year ago)', b.b_prior, colsB],
+     ['MAT TY (this year)', b.b_current, colsB]]
       .forEach(([label, v, known]) => {
-        if (!v) problems.push(`${b.label}: ${label} is not mapped`);
+        if (!v) problems.push(`${b.label}: no ${label} column resolved`);
         // Only enforce membership when the profile actually listed columns; an
         // empty set means we do not know, and guessing would be worse.
         else if (known.size && !known.has(v)) {
@@ -1790,8 +1885,19 @@ function renderRun() {
     FAIL: `<div class="notice err">QC found ${qc.counts.FAIL} failure(s). Fix before distributing.</div>`,
   }[qc.worst];
 
+  // `notes` carries anything that would otherwise be a silently wrong number -
+  // chiefly a degenerate period wiring, where prior and current resolve to the
+  // same column and every growth rate reads 0%. The server has always sent it;
+  // it was never rendered, so a warning nobody sees was doing no work.
+  const notes = (d.notes || []).filter(Boolean);
+  const notesBanner = notes.length
+    ? `<div class="notice warn"><b>Check the period wiring</b><ul style="margin:6px 0 0 18px">${
+        notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></div>`
+    : '';
+
   $('#run-out').innerHTML = `
     ${qcBanner}
+    ${notesBanner}
     <div class="kpis">
       <div class="kpi neutral"><div class="k-label">Categories analysed</div>
         <div class="k-value">${cats.length}</div>
@@ -1838,7 +1944,10 @@ function renderCategory(rep, scale, unit) {
          is_rate_metric: !!rep.is_rate_metric,
          growth_applicable: rep.growth_applicable !== false,
          total: rep.total, channel_block: rep.channel_block,
-         brand_block: rep.brand_block, manufacturer_top_n: rep.manufacturer_top_n,
+         channel_level_block: rep.channel_level_block,
+         region_level_block: rep.region_level_block,
+         market_other_block: rep.market_other_block,
+         manufacturer_top_n: rep.manufacturer_top_n,
          brand_top_n: rep.brand_top_n, client_brands: rep.client_brands,
          client_manufacturers: rep.client_manufacturers,
          contributors: rep.contributors, insights: rep.insights,
@@ -1859,10 +1968,6 @@ function renderCategory(rep, scale, unit) {
 function renderMetricSection(m, scale, unit, ordinal, totalMetrics) {
   const t = m.total || {};
   const g = m.growth_applicable !== false;
-  const ch = m.channel_block || [];
-  const br = m.brand_block || [];
-  const mt = m.manufacturer_top_n || [];
-  const bt = m.brand_top_n || [];
 
   const heading = totalMetrics > 1
     ? `<h3 class="metric-head">${ordinal}. ${esc(m.label)}</h3>` : '';
@@ -1900,13 +2005,39 @@ function renderMetricSection(m, scale, unit, ordinal, totalMetrics) {
         <div class="k-sub">on MAT TY</div></div>
     </div>
 
-    ${ch.length ? `<div class="blk">
-      <div class="blk-head"><h4>Market / channel block</h4>
-        <span class="sub">${esc(m.label)}${unit ? ' (' + unit + ')' : ''} · BEFORE vs AFTER${g
-          ? ' with level shift and contribution' : ' — top channels by TY, with absolute change'}</span></div>
+    ${renderMarketBlocks(m, scale, unit, g)}
+    ${renderEntities({ ...m, contributors: m.contributors }, { scale, unit, g })}
+  `;
+}
+
+/**
+ * The market blocks, one per level.
+ *
+ * The Total Market is shown once at the top of each block and is **not repeated
+ * as a member row**, because the members are the levels beneath it: showing the
+ * total inside its own parts double-counts it and makes every share in the block
+ * wrong. A block is only drawn when the user paired at least one value at that
+ * level, so a run with no regions simply has no region block.
+ */
+function renderMarketBlocks(m, scale, unit, g) {
+  const levels = [
+    ['channel', 'Market / Channel block', 'channels'],
+    ['region', 'Market / Region block', 'regions'],
+    ['other', 'Market block', 'markets'],
+  ];
+  return levels.map(([key, title, noun]) => {
+    const blk = m[`${key}_level_block`]
+      || (key === 'other' ? m.market_other_block : null);
+    if (!blk || !(blk.members || []).length) return '';
+    const tot = blk.total;
+    const rows = [...(blk.members || [])];
+    return `<div class="blk">
+      <div class="blk-head"><h4>${esc(title)}</h4>
+        <span class="sub">${esc(m.label)}${unit ? ' (' + unit + ')' : ''} · Total Market, then the ${esc(noun)} beneath it${g
+          ? ' — level shift and contribution' : ' — absolute change and share'}</span></div>
       <div class="tbl-wrap"><table>
         <thead>${g ? `<tr>
-            <th rowspan="2">Channels</th>
+            <th rowspan="2">${esc(key === 'region' ? 'Regions' : key === 'channel' ? 'Channels' : 'Markets')}</th>
             <th colspan="3" class="grp-before">BEFORE</th>
             <th colspan="3" class="grp-after">AFTER</th>
             <th colspan="3">Level Shift</th>
@@ -1918,7 +2049,7 @@ function renderMetricSection(m, scale, unit, ordinal, totalMetrics) {
             <th>MATTY</th><th>Before</th><th>After</th>
             <th>Before</th><th>After</th>
           </tr>` : `<tr>
-            <th rowspan="2">Channels</th>
+            <th rowspan="2">${esc(key === 'region' ? 'Regions' : key === 'channel' ? 'Channels' : 'Markets')}</th>
             <th colspan="2" class="grp-before">BEFORE</th>
             <th colspan="2" class="grp-after">AFTER</th>
             <th colspan="2">Change</th>
@@ -1931,90 +2062,57 @@ function renderMetricSection(m, scale, unit, ordinal, totalMetrics) {
             <th>Before</th><th>After</th>
           </tr>`}</thead>
         <tbody>
-          ${ch.map(c => g ? `<tr>
-            <td>${esc(c.name)}</td>
-            <td class="num">${fmtVal(c.before.mat_ya, scale, unit)}</td>
-            <td class="num">${fmtVal(c.before.mat_ty, scale, unit)}</td>
-            <td class="num ${cls(c.before.growth_pct)}">${pct(c.before.growth_pct)}</td>
-            <td class="num">${fmtVal(c.after.mat_ya, scale, unit)}</td>
-            <td class="num">${fmtVal(c.after.mat_ty, scale, unit)}</td>
-            <td class="num ${cls(c.after.growth_pct)}">${pct(c.after.growth_pct)}</td>
-            <td class="num ${cls(c.level_shift.mat_ty_pp)}">${pp(c.level_shift.mat_ty_pp)}</td>
-            <td class="num">${fmtNum(c.level_shift.before_share_pct, 1)}%</td>
-            <td class="num">${fmtNum(c.level_shift.after_share_pct, 1)}%</td>
-            <td class="num">${fmtNum(c.contribution.before_share_pct, 1)}%</td>
-            <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
-          </tr>` : `<tr>
-            <td>${esc(c.name)}</td>
-            <td class="num">${fmtVal(c.before.mat_ya, scale, unit)}</td>
-            <td class="num">${fmtVal(c.before.mat_ty, scale, unit)}</td>
-            <td class="num">${fmtVal(c.after.mat_ya, scale, unit)}</td>
-            <td class="num">${fmtVal(c.after.mat_ty, scale, unit)}</td>
-            <td class="num ${cls((c.after.mat_ty || 0) - (c.after.mat_ya || 0))}">${fmtVal((c.after.mat_ty || 0) - (c.after.mat_ya || 0), scale, unit)}</td>
-            <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
-            <td class="num">${fmtNum(c.contribution.before_share_pct, 1)}%</td>
-            <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
-          </tr>`).join('')}
-          <tr class="total">
-            <td>Total</td>
-            <td class="num">${fmtVal(t.before_prior, scale, unit)}</td>
-            <td class="num">${fmtVal(t.before_current, scale, unit)}</td>
-            ${g ? `<td class="num ${cls(t.before_growth_pct)}">${pct(t.before_growth_pct)}</td>` : '<td class="num">—</td>'}
-            <td class="num">${fmtVal(t.after_prior, scale, unit)}</td>
-            <td class="num">${fmtVal(t.after_current, scale, unit)}</td>
-            ${g ? `<td class="num ${cls(t.after_growth_pct)}">${pct(t.after_growth_pct)}</td>
-            <td class="num ${cls(t.level_shift_pp)}">${pp(t.level_shift_pp)}</td>` :
-            `<td class="num ${cls((t.after_current || 0) - (t.after_prior || 0))}">${fmtVal((t.after_current || 0) - (t.after_prior || 0), scale, unit)}</td>
-            <td class="num">100.0%</td>`}
-            <td class="num">100.0%</td><td class="num">100.0%</td>
-            <td class="num">100.0%</td><td class="num">100.0%</td>
-          </tr>
+          ${tot ? renderMarketRow(tot, scale, unit, g, true) : ''}
+          ${rows.map(c => renderMarketRow(c, scale, unit, g, false)).join('')}
         </tbody>
       </table></div>
-    </div>` : ''}
-    ${renderEntities({ ...m, contributors: m.contributors }, { scale, unit, g })}
-  `;
+    </div>`;
+  }).join('');
+}
+
+/** One row of a market block: the Total (class `total`) or a member. */
+function renderMarketRow(c, scale, unit, g, isTotal) {
+  const label = isTotal ? `Total Market${c.name ? ' · ' + c.name : ''}` : c.name;
+  const cls0 = isTotal ? ' class="total"' : '';
+  if (g) {
+    return `<tr${cls0}>
+      <td>${esc(label)}</td>
+      <td class="num">${fmtVal(c.before.mat_ya, scale, unit)}</td>
+      <td class="num">${fmtVal(c.before.mat_ty, scale, unit)}</td>
+      <td class="num ${cls(c.before.growth_pct)}">${pct(c.before.growth_pct)}</td>
+      <td class="num">${fmtVal(c.after.mat_ya, scale, unit)}</td>
+      <td class="num">${fmtVal(c.after.mat_ty, scale, unit)}</td>
+      <td class="num ${cls(c.after.growth_pct)}">${pct(c.after.growth_pct)}</td>
+      <td class="num ${cls(c.level_shift.mat_ty_pp)}">${pp(c.level_shift.mat_ty_pp)}</td>
+      <td class="num">${fmtNum(c.level_shift.before_share_pct, 1)}%</td>
+      <td class="num">${fmtNum(c.level_shift.after_share_pct, 1)}%</td>
+      <td class="num">${fmtNum(c.contribution.before_share_pct, 1)}%</td>
+      <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
+    </tr>`;
+  }
+  return `<tr${cls0}>
+    <td>${esc(label)}</td>
+    <td class="num">${fmtVal(c.before.mat_ya, scale, unit)}</td>
+    <td class="num">${fmtVal(c.before.mat_ty, scale, unit)}</td>
+    <td class="num">${fmtVal(c.after.mat_ya, scale, unit)}</td>
+    <td class="num">${fmtVal(c.after.mat_ty, scale, unit)}</td>
+    <td class="num ${cls((c.after.mat_ty || 0) - (c.after.mat_ya || 0))}">${fmtVal((c.after.mat_ty || 0) - (c.after.mat_ya || 0), scale, unit)}</td>
+    <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
+    <td class="num">${fmtNum(c.contribution.before_share_pct, 1)}%</td>
+    <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
+  </tr>`;
 }
 
 /** Brand / manufacturer / client tables and the contributor grid, per metric. */
 function renderEntities(m, { scale, unit, g }) {
-  const br = m.brand_block || [];
+  // The brand *value share* block was removed on request. Brand Top-N and the
+  // client-brand tracker are separate tables and are unaffected - one answers
+  // "who is biggest and how did they move", the other "how are our named brands
+  // doing", and neither is a share-of-category presentation.
   const mt = m.manufacturer_top_n || [];
   const bt = m.brand_top_n || [];
   const rep = m;
   return `
-    ${br.length ? `
-    <div class="blk">
-      <div class="blk-head"><h4>Brand value share</h4>
-        <span class="sub">share of the category, before vs after</span></div>
-      <div class="tbl-wrap" style="max-height:420px;overflow:auto">
-        <table>
-          <thead>
-            <tr><th rowspan="2">Brands</th>
-              <th colspan="3" class="grp-before">BEFORE</th>
-              <th colspan="3" class="grp-after">AFTER</th></tr>
-            <tr><th>MAT YA</th><th>MAT TY</th><th>MAT share chg</th>
-                <th>MAT YA</th><th>MAT TY</th><th>MAT share chg</th></tr>
-          </thead>
-          <tbody>
-            ${br.slice(0, 30).map(b => {
-              const chg = (b.before.share_pct !== null && b.after.share_pct !== null)
-                ? b.after.share_pct - b.before.share_pct : null;
-              return `<tr>
-                <td>${esc(b.name)}</td>
-                <td class="num">${fmtNum(b.before.share_pct, 1)}%</td>
-                <td class="num">${fmtNum(b.before.share_pct, 1)}%</td>
-                <td class="num ${cls(b.before.share_chg_pp)}">${pp(b.before.share_chg_pp)}</td>
-                <td class="num">${fmtNum(b.after.share_pct, 1)}%</td>
-                <td class="num">${fmtNum(b.after.share_pct, 1)}%</td>
-                <td class="num ${cls(chg)}">${pp(chg)}</td>
-              </tr>`;
-            }).join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>` : ''}
-
     ${mt.length ? `
     <div class="blk">
       <div class="blk-head"><h4>Manufacturer Top-${mt.length}</h4>
@@ -2223,34 +2321,107 @@ function renderExport(d) {
 // ---------------------------------------------------------------------------
 // wiring
 // ---------------------------------------------------------------------------
-$('#btn-upload')?.addEventListener('click', async () => {
-  const fi = $('#file-input');
-  if (!fi.files.length) return;
-  const fd = new FormData();
-  fd.append('file', fi.files[0]);
-  overlay(true, 'Uploading…');
-  try {
-    await api('/api/source', { method: 'POST', body: fd });
-    await loadSources();
-    $('#upload-msg').textContent = `Registered ${fi.files[0].name}`;
-    fi.value = '';
-  } catch (e) { $('#upload-msg').textContent = 'Error: ' + e.message; }
-  finally { overlay(false); }
+
+// Step 1 is deliberately two actions in order: upload a file, then load the two
+// datasets from it. The loader stays hidden until a source exists, so the user
+// is not asked to choose a source that does not exist yet - and the profile
+// button stays disabled until both sides are wired, so the wizard cannot be
+// advanced into a state the next step cannot serve.
+const uploadBtn = $('#btn-upload');
+const fileInput = $('#file-input');
+const fileChip = $('#file-chip');
+const loader = $('#loader');
+const dropZone = $('#drop');
+
+function setPickedFile(file) {
+  if (!file) {
+    uploadBtn.disabled = true;
+    fileChip.hidden = true;
+    fileChip.textContent = '';
+    return;
+  }
+  uploadBtn.disabled = false;
+  fileChip.hidden = false;
+  fileChip.textContent = `${file.name} · ${fmtBytes(file.size)}`;
+}
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n) || n <= 0) return '0 B';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v >= 10 || i === 0 ? Math.round(v) : v.toFixed(1)} ${u[i]}`;
+}
+
+// Two ways to satisfy the same action, and both must be visible: clicking the
+// zone (a <label>, so the browser opens the picker) and dropping onto it.
+fileInput?.addEventListener('change', () => {
+  setPickedFile(fileInput.files[0] || null);
 });
 
-$('#btn-path')?.addEventListener('click', async () => {
-  const p = $('#path-input').value.trim();
-  if (!p) return;
-  overlay(true, 'Opening…');
-  try {
-    const d = await api('/api/source/from-path', {
-      method: 'POST', body: JSON.stringify({ path: p }),
+if (dropZone) {
+  for (const ev of ['dragenter', 'dragover']) {
+    dropZone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dropZone.classList.add('over');
     });
+  }
+  for (const ev of ['dragleave', 'drop']) {
+    dropZone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      dropZone.classList.remove('over');
+    });
+  }
+  dropZone.addEventListener('drop', (e) => {
+    const f = e.dataTransfer?.files?.[0];
+    if (!f) return;
+    // Route the dropped file through the real input, so there is one upload
+    // path and the visible selection always matches what Upload will send.
+    const dt = new DataTransfer();
+    dt.items.add(f);
+    fileInput.files = dt.files;
+    setPickedFile(f);
+  });
+}
+
+uploadBtn?.addEventListener('click', async () => {
+  if (!fileInput.files.length) return;
+  const fd = new FormData();
+  fd.append('file', fileInput.files[0]);
+  overlay(true, 'Uploading…');
+  try {
+    const d = await api('/api/source', { method: 'POST', body: fd });
     await loadSources();
-    $('#upload-msg').textContent = `Registered ${d.filename} (${d.sheets.length} sheets)`;
-  } catch (e) { $('#upload-msg').textContent = 'Error: ' + e.message; }
-  finally { overlay(false); }
+    // Point both sides at what was just uploaded: with one file in play, asking
+    // the user to pick it twice is a choice with one answer.
+    const sid = d?.id || (S.sources[S.sources.length - 1] || {}).id;
+    if (sid) {
+      for (const side of ['a', 'b']) {
+        const sel = $(`#${side}-source`);
+        if (sel && [...sel.options].some(o => o.value === sid)) {
+          sel.value = sid;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }
+    }
+    dropZone?.classList.add('has-file');
+    $(`#upload-msg`).textContent =
+      `Loaded ${d?.filename || fileInput.files[0].name}` +
+      `${d?.sheets?.length ? ` · ${d.sheets.length} sheets` : ''}`;
+    fileInput.value = '';
+    setPickedFile(null);
+    if (loader) loader.hidden = false;
+  } catch (e) { $(`#upload-msg`).textContent = 'Error: ' + e.message; }
+  finally { overlay(false); syncStep1(); }
 });
+
+// The profile button is enabled only when both sides have a source, so it never
+// looks ready before there is anything to profile.
+function syncStep1() {
+  const ok = ['a', 'b'].every(side => ($(`#${side}-source`)?.value || '') !== '');
+  const btn = $('#btn-profile');
+  if (btn) btn.disabled = !ok;
+}
 
 ['a', 'b'].forEach(side => {
   $(`#${side}-source`)?.addEventListener('change', () => onSourceChange(side));

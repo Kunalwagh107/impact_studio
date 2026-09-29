@@ -137,8 +137,25 @@ async function main() {
   await send('Page.navigate', { url: APP + '/?_comp=' + Date.now() })
   await sleep(2500)
 
-  await setInput('#path-input', WORKBOOK)
-  await click('#btn-path')
+  // Step 1 is upload-first: the workbook goes through the hidden #file-input,
+  // then #btn-upload registers it. There is no #path-input / #btn-path any more.
+  // Bytes come from /__workbook/ - an empty File uploads 0 bytes and every later
+  // sheet/column read 500s, which reads like a broken control.
+  console.log('  upload:', await evaluate(`(async () => {
+    const el = document.querySelector('#file-input')
+    if (!el) return 'NOT_FOUND'
+    const name = ${JSON.stringify(WORKBOOK)}.split(/[\\\\/]/).pop()
+    const r = await fetch('/__workbook/' + encodeURIComponent(name), { cache: 'no-store' })
+    if (!r.ok) return 'fetch ' + r.status
+    const buf = await r.arrayBuffer()
+    if (!buf || buf.byteLength === 0) return 'served 0 bytes'
+    const dt = new DataTransfer()
+    dt.items.add(new File([buf], name, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
+    el.files = dt.files
+    el.dispatchEvent(new Event('change', { bubbles: true }))
+    return 'ok:' + buf.byteLength
+  })()`))
+  await click('#btn-upload')
   await sleep(4000)
   const srcOpts = await evaluate(
     `[...document.querySelector('#a-source').options].map(o => o.value).filter(Boolean)`)

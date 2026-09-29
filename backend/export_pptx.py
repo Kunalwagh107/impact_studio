@@ -369,6 +369,14 @@ def build_category_deck(report: dict, qc: dict, out_path: str,
 
             # ---- 3b. Level shift / absolute change + contribution ----------
             s = prs.slides.add_slide(blank)
+            # The row to shade as the total: the leading Total Market when one is
+            # designated, otherwise the trailing sum we append ourselves. Resolved
+            # to a concrete index once `rows` is known. `report["baseline"]["name"]`
+            # is the authoritative signal; each metric block carries its own
+            # baseline, falling back to the report's, because the wrong name would
+            # silently reinstate a double-count on a secondary metric's slide.
+            has_baseline = bool(((blk.get("baseline") or report.get("baseline") or {})
+                                 .get("name")))
             if growth_ok:
                 _title(s, f"Level shift and contribution - {metric}",
                        "How each channel's growth and share of the category moved")
@@ -384,17 +392,24 @@ def build_category_deck(report: dict, qc: dict, out_path: str,
                         f"{(b['contribution']['before_share_pct'] or 0):.1f}%",
                         f"{(b['contribution']['after_share_pct'] or 0):.1f}%",
                     ])
-                rows.append([
-                    "Total", _fmt(mt.get("before_current"), m_scale, m_unit),
-                    _fmt(mt.get("after_current"), m_scale, m_unit),
-                    _pct(mt.get("before_growth_pct")), _pct(mt.get("after_growth_pct")),
-                    _pp(ls), "100.0%", "100.0%",
-                ])
+                # A Total row is appended only when no Total Market baseline was
+                # designated. With a baseline, `m_ch[0]` *is* the Total Market, and
+                # `report["total"]` is the sum over every row of the category - the
+                # Total Market plus its own members - so printing it here would
+                # double-count the block it annotates.
+                if not has_baseline:
+                    rows.append([
+                        "Total", _fmt(mt.get("before_current"), m_scale, m_unit),
+                        _fmt(mt.get("after_current"), m_scale, m_unit),
+                        _pct(mt.get("before_growth_pct")), _pct(mt.get("after_growth_pct")),
+                        _pp(ls), "100.0%", "100.0%",
+                    ])
+                total_row_idx = 0 if has_baseline else len(rows) - 1
                 _table(s, ["Channel", "BEFORE MAT TY", "AFTER MAT TY", "BEFORE growth",
                            "AFTER growth", "Level shift", "Contrib before", "Contrib after"],
                        rows, Inches(0.6), Inches(1.7), SW - Inches(1.2), Inches(4.9),
                        col_w=[30, 11, 11, 10, 10, 10, 10, 10], font=9.5,
-                       highlight_rows={len(rows) - 1})
+                       highlight_rows={total_row_idx})
             else:
                 _title(s, f"Top channels and absolute change - {metric}",
                        "Distribution level: TY minus YA, no percentage growth")
@@ -408,18 +423,20 @@ def build_category_deck(report: dict, qc: dict, out_path: str,
                         _fmt(b["after"]["mat_ty"], m_scale, m_unit),
                         _fmt(b.get("abs_change"), m_scale, m_unit),
                     ])
-                rows.append([
-                    "Total", _fmt(mt.get("before_prior"), m_scale, m_unit),
-                    _fmt(mt.get("before_current"), m_scale, m_unit),
-                    _fmt(mt.get("after_prior"), m_scale, m_unit),
-                    _fmt(mt.get("after_current"), m_scale, m_unit),
-                    _fmt(ac, m_scale, m_unit),
-                ])
+                if not has_baseline:
+                    rows.append([
+                        "Total", _fmt(mt.get("before_prior"), m_scale, m_unit),
+                        _fmt(mt.get("before_current"), m_scale, m_unit),
+                        _fmt(mt.get("after_prior"), m_scale, m_unit),
+                        _fmt(mt.get("after_current"), m_scale, m_unit),
+                        _fmt(ac, m_scale, m_unit),
+                    ])
+                total_row_idx = 0 if has_baseline else len(rows) - 1
                 _table(s, ["Top channel (by TY)", "BEFORE MAT YA", "BEFORE MAT TY",
                            "AFTER MAT YA", "AFTER MAT TY", "Abs change (TY - YA)"],
                        rows, Inches(0.6), Inches(1.7), SW - Inches(1.2), Inches(4.9),
                        col_w=[34, 14, 14, 14, 14, 16], font=10,
-                       highlight_rows={len(rows) - 1})
+                       highlight_rows={total_row_idx})
 
     # ---- 5. Manufacturer Top-N ---------------------------------------------
     mtop = report.get("manufacturer_top_n") or []
@@ -431,36 +448,25 @@ def build_category_deck(report: dict, qc: dict, out_path: str,
         rows = []
         for b in mtop:
             rows.append([
-                b["name"][:30], b["rank_before"] or "-", b["rank_after"] or "-",
+                b["name"][:30],
+                _fmt(b.get("before_prior"), scale, unit),
+                _fmt(b.get("before_current"), scale, unit),
+                _fmt(b.get("before_current"), scale, unit),
+                _fmt(b.get("after_current"), scale, unit),
+                _pp(b.get("share_change_pp")),
+                b["rank_before"] or "-",
+                b["rank_after"] or "-",
                 (f"{b['rank_change']:+d}" if b.get("rank_change") is not None else "-"),
-                _fmt(b["before_current"], scale, unit),
-                _fmt(b["after_current"], scale, unit),
-                _pct(b["after_growth_pct"]),
                 b.get("movement") or "",
             ])
-        _table(s, ["Manufacturer", "Rank BEFORE", "Rank AFTER", "Rank chg",
-                   "BEFORE MAT TY", "AFTER MAT TY", "AFTER growth", "Movement"],
+        _table(s, ["Manufacturer", "MAT YA", "MAT TY", "Before", "After",
+                   "Share chg", "Rank BEFORE", "Rank AFTER", "Rank chg", "Movement"],
                rows, Inches(0.6), Inches(1.7), SW - Inches(1.2), Inches(4.9),
-               col_w=[30, 9, 9, 8, 12, 12, 10, 10], font=9.5,
+               col_w=[24, 9, 9, 9, 9, 9, 9, 9, 8, 10], font=9,
                highlight_rows={i for i, b in enumerate(mtop)
                                if b.get("movement") in ("NEW", "EXITED")})
 
-    # ---- 6. Brand value share ----------------------------------------------
-    bblocks = report.get("brand_block") or []
-    if bblocks:
-        s = prs.slides.add_slide(blank)
-        _title(s, "Brand value share",
-               f"Share of {cat} by brand, before vs after")
-        top = bblocks[:12]
-        cats = [b["name"][:22] for b in top]
-        before = [b["before"]["share_pct"] or 0 for b in top]
-        after = [b["after"]["share_pct"] or 0 for b in top]
-        _chart(s, XL_CHART_TYPE.BAR_CLUSTERED, cats,
-               [("BEFORE share %", before), ("AFTER share %", after)],
-               Inches(0.6), Inches(1.6), SW - Inches(1.2), Inches(5.0),
-               colors=(GREEN, BLUE), number_format='0.0"%"', gap=50)
-
-    # ---- 7. Client brands ---------------------------------------------------
+    # ---- 6. Client brands ---------------------------------------------------
     clients = (report.get("client_brands") or []) + \
               (report.get("client_manufacturers") or [])
     if clients:

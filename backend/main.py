@@ -604,28 +604,51 @@ class RunRequest(BaseModel):
     trend_b: DatasetSpec | None = None
 
 
+def _resolve_mat_slots(a_prior: str, a_current: str, b_prior: str,
+                       b_current: str, df_a: pd.DataFrame, df_b: pd.DataFrame,
+                       metric_label: str = "") -> tuple[str, str, str, str]:
+    """Resolve a metric block's two period slots. Delegates to the engine.
+
+    The rule lives in ``A.resolve_mat_slots`` and nothing here re-implements it:
+    the analysis, this pre-flight validation and the QC must agree on which
+    column each period is, and two copies of the rule is how they stop agreeing.
+    """
+    return A.resolve_mat_slots(a_prior, a_current, b_prior, b_current,
+                               df_a, df_b, metric_label)
+
+
 def _validate_metric_wiring(req: RunRequest, df_a: pd.DataFrame,
                             df_b: pd.DataFrame) -> list[str]:
     """Return a list of reasons the metric wiring is unusable.
 
     Without this the run proceeds with blank column names and every figure comes
     back empty, which reads as "the metric selection does not work".
+
+    The period columns are resolved from the family before being checked, so the
+    validation tests the columns the run will actually read rather than the ones
+    the client happened to send.
     """
     problems: list[str] = []
 
     def check_block(label: str, a_prior: str, a_current: str,
                     b_prior: str, b_current: str, weight_a: str,
                     weight_b: str, is_rate: bool) -> None:
-        for side, df, prior, current in (
+        a_prior, a_current, b_prior, b_current = _resolve_mat_slots(
+            a_prior, a_current, b_prior, b_current, df_a, df_b, label)
+        for side, df, ya, ty in (
             (f"{label}: A (previous)", df_a, a_prior, a_current),
             (f"{label}: B (updated)", df_b, b_prior, b_current),
         ):
-            for role, col in (("prior period", prior), ("current period", current)):
+            for role, col in (("MAT YA (year ago)", ya), ("MAT TY (this year)", ty)):
                 if not col:
-                    problems.append(f"Dataset {side}: no {role} column selected.")
+                    problems.append(
+                        f"Dataset {side}: no {role} column could be resolved. "
+                        f"The metric family needs a year-ago column (a name "
+                        f"ending YA) and a current one (the unqualified name or "
+                        f"one ending TY).")
                 elif col not in df.columns:
                     problems.append(
-                        f"Dataset {side}: column '{col}' for the {role} does not exist "
+                        f"Dataset {side}: column '{col}' for {role} does not exist "
                         f"in this dataset. Available numeric columns: "
                         f"{', '.join(sorted(df.select_dtypes('number').columns)[:12])}"
                     )
@@ -697,8 +720,19 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
     scope = list(req.markets)
     scope_b: list[str] = []
     baseline_b = ""
+    # The level of every *authored* pairing, by both the A and the B name. The
+    # analysis splits its market presentation on this map (Total at the top, then
+    # the channels, then the regions), so it has to carry the user's own level
+    # decisions - not the advisory classification - or the blocks would be split
+    # on something the user did not choose.
+    pair_levels: dict[str, str] = {}
     if req.market_pairs:
         mk = MK.enumerate_markets([], [], pairs=req.market_pairs)
+        for p in mk.pairs:
+            if p.market_a:
+                pair_levels[str(p.market_a)] = str(p.level or "total").lower()
+            if p.market_b:
+                pair_levels[str(p.market_b)] = str(p.level or "total").lower()
         lvl = (req.market_level or "total").strip() or "total"
         if not scope:
             scope, scope_b = MK.resolve_scope(mk, lvl)
@@ -718,6 +752,11 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
         lvl = (req.market_level or "").strip()
         if lvl and lvl != "all" and req.market_levels:
             scope = sorted(m for m, l in req.market_levels.items() if l == lvl)
+    if not pair_levels:
+        # Nothing authored: the advisory map is all there is, so use it, and the
+        # split still works rather than collapsing everything into one block.
+        pair_levels = {str(k): str(v or "").lower()
+                       for k, v in (req.market_levels or {}).items()}
 
     if metric is not None:
         metric_label = metric.label or metric.key or req.metric_label
@@ -735,6 +774,14 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
         growth_applicable = not is_rate
         weight_a, weight_b = req.weight_metric_a, req.weight_metric_b
         metric_key = ""
+
+    # The two periods the study reads, re-derived here from the Metric Period
+    # columns. Whatever the client sent is treated as a hint only: the family
+    # names MAT YA and MAT TY itself, and resolving them in one place keeps the
+    # validation, the analysis and the QC on the same pair. `prepare` resolves
+    # them again against the same frames and will agree.
+    a_prior, a_current, b_prior, b_current = _resolve_mat_slots(
+        a_prior, a_current, b_prior, b_current, df_a, df_b, metric_label)
 
     cfg = A.AnalysisConfig(
         metric_label=metric_label,
@@ -762,7 +809,7 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
         categories=req.categories,
         top_n=int(req.top_n),
         client_brands=req.client_brands,
-        market_levels=req.market_levels,
+        market_levels=pair_levels,
         baseline_market=req.baseline_market,
         baseline_market_b=baseline_b,
         mapping_a=req.mapping_a,
@@ -922,7 +969,9 @@ def _run_reports(req: RunRequest):
                 "total": rep["total"],
                 "insights": rep.get("insights") or [],
                 "channel_block": rep.get("channel_block") or [],
-                "brand_block": rep.get("brand_block") or [],
+                "channel_level_block": (rep.get("blocks") or {}).get("channel"),
+                "region_level_block": (rep.get("blocks") or {}).get("region"),
+                "market_other_block": (rep.get("blocks") or {}).get("market_other"),
                 "manufacturer_top_n": rep.get("manufacturer_top_n") or [],
                 "brand_top_n": rep.get("brand_top_n") or [],
                 "client_brands": rep.get("client_brands") or [],
@@ -945,7 +994,9 @@ def _run_reports(req: RunRequest):
             rep["total"] = head["total"]
             rep["insights"] = head["insights"]
             rep["channel_block"] = head["channel_block"]
-            rep["brand_block"] = head["brand_block"]
+            rep["channel_level_block"] = head.get("channel_level_block")
+            rep["region_level_block"] = head.get("region_level_block")
+            rep["market_other_block"] = head.get("market_other_block")
             rep["manufacturer_top_n"] = head["manufacturer_top_n"]
             rep["brand_top_n"] = head["brand_top_n"]
             rep["client_brands"] = head["client_brands"]
@@ -1011,7 +1062,12 @@ def _compact_report(rep: dict, top_n: int) -> dict:
         "insights": rep.get("insights") or [],
         "baseline": rep.get("baseline") or {},
         "channel_block": (rep.get("channel_block") or [])[:25],
-        "brand_block": (rep.get("brand_block") or [])[:30],
+        "channel_level_block": rep.get("channel_level_block"),
+        "region_level_block": rep.get("region_level_block"),
+        "market_other_block": rep.get("market_other_block"),
+        # Brand *value share* is deliberately not carried: the client asked for it
+        # to be removed from the analysis. Brand Top-N and client brands remain -
+        # they answer a different question and are unaffected.
         "manufacturer_top_n": rep.get("manufacturer_top_n") or [],
         "brand_top_n": rep.get("brand_top_n") or [],
         "client_brands": rep.get("client_brands") or [],
@@ -1297,6 +1353,27 @@ def health():
 
 if os.path.isdir(FRONTEND):
     app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
+
+    @app.get("/__workbook/{name}")
+    def serve_workbook(name: str):
+        """Hand a project workbook to the *page*, so a headless probe can build a
+        real ``File`` for the upload control.
+
+        A probe cannot read the local disk: feeding ``new File([''])`` into
+        ``#file-input`` uploads a 0-byte file, the source registers, and then
+        every sheet/column read 500s with "File is not a zip file" - which is
+        indistinguishable from a broken upload control from the outside. Fetching
+        the bytes back also proves the served file is intact.
+
+        Scoped to the project root by name, with no directory traversal, and it
+        only ever returns files that already exist in this repo.
+        """
+        import pathlib
+        root = pathlib.Path(ROOT).resolve()
+        p = (root / name).resolve()
+        if p.parent != root or not p.is_file():
+            raise HTTPException(404, "no such workbook")
+        return FileResponse(str(p), filename=p.name)
 
     @app.get("/", response_class=HTMLResponse)
     def index():

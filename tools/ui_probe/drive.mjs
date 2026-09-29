@@ -134,6 +134,43 @@ async function main() {
     el.dispatchEvent(new Event('change', { bubbles: true }))
     return 'ok'
   })()`)
+  // Step 1 is now upload-first: there is no path box and no #btn-path. The file
+  // is fed through the hidden #file-input (the same node the drop zone targets),
+  // which fires the change listener that arms #btn-upload; then #btn-upload
+  // posts it and auto-selects the new source on *both* sides.
+  //
+  // The bytes must be REAL. `new File([''])` uploads a 0-byte file: the source
+  // registers, the picker fills, and then every sheet/column read 500s with
+  // "File is not a zip file" - which reads exactly like a broken upload control
+  // and is in fact a broken probe. So fetch the workbook back from the server
+  // (which also proves the served bytes are intact) and build the File from them.
+  const uploadWorkbook = async (filePath) => {
+    const first = await evaluate(`(async () => {
+      const el = document.querySelector('#file-input')
+      if (!el) return { err: 'NOT_FOUND' }
+      const name = ${JSON.stringify(filePath)}.split(/[\\\\/]/).pop()
+      const url = '/__workbook/' + encodeURIComponent(name)
+      let buf
+      try {
+        const r = await fetch(url, { cache: 'no-store' })
+        if (!r.ok) return { err: 'fetch ' + r.status + ' for ' + url }
+        buf = await r.arrayBuffer()
+      } catch (e) { return { err: String(e) } }
+      if (!buf || buf.byteLength === 0) return { err: 'served 0 bytes for ' + url }
+      const dt = new DataTransfer()
+      dt.items.add(new File([buf], name, { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }))
+      el.files = dt.files
+      el.dispatchEvent(new Event('change', { bubbles: true }))
+      return { ok: 'ok', bytes: buf.byteLength }
+    })()`)
+    if (first.err) return first.err
+    console.log(`  upload source bytes: ${first.bytes} bytes`)
+    const armed = await evaluate(
+      `!document.querySelector('#btn-upload')?.disabled`)
+    if (!armed) return 'BTN_DISABLED'
+    await click('#btn-upload')
+    return 'ok'
+  }
   const click = (sel) => evaluate(`(() => {
     const el = document.querySelector(${JSON.stringify(sel)})
     if (!el) return 'NOT_FOUND'
@@ -252,12 +289,17 @@ async function main() {
   await shot('01-step1-empty')
 
   // ---- register the workbook ---------------------------------------------
-  await setInput('#path-input', WORKBOOK)
-  await click('#btn-path')
+  const up = await uploadWorkbook(WORKBOOK)
+  check('workbook upload accepted', up === 'ok', up)
   await sleep(4000)
   const reg = await evaluate(`document.querySelector('#upload-msg')?.textContent`)
   console.log('  register:', reg)
-  check('workbook registered', /Registered/.test(reg || ''), String(reg))
+  // The app reports `Loaded <file> · <n> sheets`. Accept either verb, but DO
+  // require the sheet count - a registered-but-unreadable file also produces a
+  // message, and it is the count that proves the workbook was actually parsed.
+  check('workbook registered and its sheets enumerated',
+        /(Loaded|Registered)/.test(reg || '') && /\d+\s+sheets?/.test(reg || ''),
+        String(reg))
 
   const srcOpts = await evaluate(
     `[...document.querySelector('#a-source').options].map(o => o.value).filter(Boolean)`)
@@ -605,36 +647,44 @@ async function main() {
   await click('#btn-select')
   await sleep(800)
   check('advanced to step 5 (selection)', await activeStep() === '5')
-  // Wait for the step to settle: the metric picks render, every metric's period
-  // selects exist, and the wiring note has been written. Reading before the
-  // market-mapping refresh lands yields empty selects and a blank note on a
-  // panel that is actually correct.
+  // Wait for the step to settle: the metric picks render, at least one metric's
+  // period block exists, and the wiring note has been written. Reading before the
+  // market-mapping refresh lands yields a blank note on a panel that is actually
+  // correct.
+  //
+  // Note this deliberately does NOT look for `#c-periods [data-per=...]`: those
+  // were the period *selects*, and step 5 no longer has any - MAT YA / MAT TY are
+  // resolved from the Metric Period columns and only reported. Waiting on a
+  // selector that can never match made this step time out for 90s on every run
+  // and then print "step 5 did not settle" against a panel that had settled.
   const settled = await waitFor(`(() => {
     const picks = document.querySelectorAll('#c-metric-picks input[data-metric]').length
-    const periods = document.querySelectorAll('#c-periods [data-per="a_current"]').length
+    const blocks = document.querySelectorAll('#c-periods table.mini tbody tr').length
     const note = (document.querySelector('#c-metric-note') || {}).innerText || ''
-    return picks === 3 && periods >= 1 && /Wired:/i.test(note)
+    return picks === 3 && blocks >= 1 && /Wired:/i.test(note)
   })()`, 90000)
   if (!settled) console.log('  ! step 5 did not settle; reading what is there')
   // The metric choice is now a set of checkboxes (Sales Value / Volume / ND),
   // each with its own per-side family wiring and its own period pair.
-  // The period selects are re-created by every buildSelectionUI() repaint, so read
-  // them only once all four exist AND carry a value. A single evaluate() here
-  // captures whichever frame it lands in and reports empty strings on a panel
-  // that is in fact correct - which is what this check used to do. Note the
-  // selects are identified by `data-per`, not by an id.
-  const PERIODS = ['a_prior', 'a_current', 'b_prior', 'b_current']
+  // Step 5 no longer offers period *selects*: MAT YA and MAT TY are read from
+  // the Metric Period columns, and the panel reports the pair it resolved. So
+  // there is nothing to wait for here beyond the block existing, and the check
+  // moves to what the request actually carries (below).
+  //
+  // Read the *reported* pair instead: one row per period, first cell the role,
+  // then the column each side resolves to. This is what the user sees, so it is
+  // what the probe should assert on.
   const periodsRead = `(() => {
-    const g = p => {
-      const el = document.querySelector('#c-periods [data-per="' + p + '"]')
-      return el ? el.value : null
-    }
-    return ${JSON.stringify(PERIODS)}.map(g)
+    const rows = [...document.querySelectorAll('#c-periods table.mini tbody tr')]
+    return rows.map(r => {
+      const cells = [...r.querySelectorAll('td')]
+      return {
+        role: (cells[0] || {}).innerText || '',
+        a: (cells[1] && cells[1].querySelector('code') || {}).textContent || '',
+        b: (cells[2] && cells[2].querySelector('code') || {}).textContent || '',
+      }
+    })
   })()`
-  const periodsWired = await waitFor(`(() => {
-    const v = ${periodsRead}
-    return v.every(x => x)
-  })()`, 20000)
   const periodVals = await evaluate(periodsRead)
   const sel = await evaluate(`({
     picks: [...document.querySelectorAll('#c-metric-picks input[data-metric]')]
@@ -647,6 +697,8 @@ async function main() {
     cats: document.querySelectorAll('#c-categories .chip').length,
     selected: document.querySelectorAll('#c-categories .chip.on').length,
     count: document.querySelector('#c-cat-count')?.textContent,
+    resolvedRows: document.querySelectorAll('#c-periods table.mini tbody tr').length,
+    periodSelects: document.querySelectorAll('#c-periods select').length,
   })`)
   const catNames = await evaluate(`[...document.querySelectorAll('#c-categories .chip')]
     .map(c => c.dataset.cat)`)
@@ -660,13 +712,14 @@ async function main() {
         `on=${sel.onCount}`)
   check('every metric block is wired on both sides',
         sel.wireCtrls >= 2, `${sel.wireCtrls} wiring control(s) for 1 metric`)
-  check('all four period columns auto-wired on both sides',
-        periodsWired && periodVals.every(Boolean),
-        `wired=${periodsWired} · ${periodVals.join(' / ')}`)
-  // The selects hold *variant keys* (YA / VALUE); the request must carry the real
-  // column names the family maps them to. Sending the bare key is what made the
-  // server refuse the run with "column 'YA' does not exist" while this panel
-  // looked perfectly wired.
+  // The step reports the two periods it resolved - one row per period - and
+  // offers no select, because there is nothing to choose.
+  check('step 5 reports the resolved periods without offering a choice',
+        sel.resolvedRows >= 2 && sel.periodSelects === 0,
+        `${sel.resolvedRows} resolved row(s), ${sel.periodSelects} select(s)`)
+  // The request must carry the real column names, and the two slots must differ -
+  // a run where MAT YA and MAT TY collapsed onto one column reports 0% growth
+  // everywhere, which looks like a finding rather than a bug.
   const blocks = await evaluate(
     `JSON.stringify((window.buildMetricBlocks || (() => []))())`)
   const parsed = JSON.parse(blocks || '[]')
@@ -688,6 +741,19 @@ async function main() {
         parsed.length > 0 && badCols.length === 0,
         badCols.length ? JSON.stringify(badCols) : JSON.stringify(
           parsed.map(b => `${b.key}:${b.a_current}/${b.b_current}`)))
+  // The regression this whole change exists to prevent.
+  const collapsed = parsed.filter(b =>
+    b.a_prior === b.a_current || b.b_prior === b.b_current)
+  check('MAT YA and MAT TY are distinct columns on each side',
+        parsed.length > 0 && collapsed.length === 0,
+        collapsed.length
+          ? JSON.stringify(collapsed.map(b => `${b.key}: ${b.a_prior} == ${b.a_current}`))
+          : JSON.stringify(parsed.map(b => `${b.key}: YA=${b.a_prior} TY=${b.a_current}`)))
+  const usedTwoYear = parsed.filter(b => /2YA/i.test(
+    [b.a_prior, b.a_current, b.b_prior, b.b_current].join(' ')))
+  check('2YA is never read as a study period',
+        usedTwoYear.length === 0,
+        usedTwoYear.length ? JSON.stringify(usedTwoYear) : 'no 2YA reference in the request')
   check('wiring is reported as valid, not silently broken',
         /Wired:/i.test(sel.note || ''), (sel.note || '').slice(0, 70))
   // The scope chips are now derived from the market *pairings* the user authored
@@ -710,6 +776,20 @@ async function main() {
   check('a market scope is applied (not silently empty)',
         mktScope.all.length >= 1,
         `on=[${mktScope.on.join(', ')}] of ${mktScope.all.length}`)
+  // "Not empty" is too weak: the reported defect was that step 5 offered only
+  // *some* of the paired markets, and a >=1 check passes happily in that state.
+  // Assert the exact set instead - every market the user paired in step 3 must be
+  // offered here, since the pairing list is the only thing that defines scope.
+  const pairedMarkets = await evaluate(`(() => {
+    const pairs = (window.S && window.S.marketPairs) || [];
+    return [...new Set(pairs.flatMap(p => [p.market_a, p.market_b]).filter(Boolean))];
+  })()`)
+  const missing = pairedMarkets.filter(m => !mktScope.all.includes(m))
+  const extra = mktScope.all.filter(m => !pairedMarkets.includes(m))
+  check('step 5 offers EVERY market paired in step 3',
+        pairedMarkets.length > 0 && missing.length === 0 && extra.length === 0,
+        `paired=${pairedMarkets.length} offered=${mktScope.all.length} `
+        + `missing=[${missing.join(', ')}] unexpected=[${extra.join(', ')}]`)
   // Categories are offered only for the categories the user actually mapped -
   // the enumeration no longer contributes any. With the mapping list as the only
   // source, the chips are exactly the canonical names that were authored, so the
@@ -748,17 +828,21 @@ async function main() {
     cb.click(); return 'clicked';
   })()`)
   // Ticking a metric repaints #c-periods, so wait for the *second* period block
-  // and for both of its a_current selects to carry a value before reading.
+  // and for both of its resolved-period tables to be populated. There are no
+  // selects to read any more - a populated table means the metric's family
+  // resolved, which is the thing "auto-wired" is actually asking about.
   const twoWired = await waitFor(`(() => {
     if (document.querySelectorAll('#c-periods .wire-card').length < 2) return false
-    const cur = [...document.querySelectorAll('#c-periods [data-per="a_current"]')]
-    return cur.length === 2 && cur.every(el => !!el.value)
+    const rows = [...document.querySelectorAll('#c-periods table.mini tbody tr')]
+    return rows.length >= 4 && rows.every(r => r.querySelectorAll('code').length >= 1)
   })()`, 20000)
   const afterAdd = await evaluate(`({
     periods: document.querySelectorAll('#c-periods .wire-card').length,
     wireCards: document.querySelectorAll('#c-metric-wiring .wire-card').length,
-    aCurrents: [...document.querySelectorAll('#c-periods [data-per="a_current"]')]
-                 .map(el => el.value).filter(Boolean),
+    aCurrents: [...document.querySelectorAll('#c-periods table.mini tbody tr')]
+                 .map(r => (r.querySelectorAll('code')[1] || {}).textContent)
+                 .filter(Boolean),
+    unresolved: [...document.querySelectorAll('#c-periods .tag.warn')].length,
     note: document.querySelector('#c-metric-note')?.innerText,
     onCount: document.querySelectorAll('#c-metric-picks input[data-metric]:checked').length })`)
   console.log('  metric add:', JSON.stringify({ before: beforeAdd, after: afterAdd,
@@ -768,8 +852,8 @@ async function main() {
           && afterAdd.onCount === 2,
         `periods ${beforeAdd.periods} -> ${afterAdd.periods}, on=${afterAdd.onCount}`)
   check('the second metric is auto-wired too',
-        twoWired && afterAdd.aCurrents.length === 2,
-        `wired=${twoWired} · current=[${afterAdd.aCurrents.join(', ')}]`)
+        twoWired && afterAdd.aCurrents.length >= 2,
+        `wired=${twoWired} · resolved MAT TY=[${afterAdd.aCurrents.join(', ')}]`)
   check('the run is still reported valid with two metrics',
         /Wired:/i.test(afterAdd.note || ''), (afterAdd.note || '').slice(0, 90))
 

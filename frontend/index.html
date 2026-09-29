@@ -39,77 +39,100 @@
 <section class="panel" data-panel="1">
   <div class="panel-head">
     <h2>1 · Load the two datasets</h2>
-    <p>Register the previous dataset (A) and the updated dataset (B). They may live in
-       separate files, or in one workbook distinguished by a <em>Dataset</em> column.</p>
+    <p>Upload the workbook that holds your previous (A) and updated (B) data. Then
+       point each side at the sheet and columns it should read.</p>
   </div>
 
-  <div class="grid two">
-    <div class="card">
-      <div class="card-head"><span class="tag green">A</span><h3>Previous dataset</h3></div>
-      <div class="field">
-        <label>Source</label>
-        <select id="a-source"><option value="">— select —</option></select>
-      </div>
-      <div class="field">
-        <label>Sheet</label>
-        <select id="a-sheet"><option value="">—</option></select>
-      </div>
-      <div class="field">
-        <label>Header row</label>
-        <input id="a-header" type="number" value="1" min="1">
-      </div>
-      <div class="field">
-        <label>Split by column <span class="hint">(optional)</span></label>
-        <select id="a-splitcol"><option value="">— none —</option></select>
-      </div>
-      <div class="field" id="a-value-wrap" style="display:none">
-        <label>Dataset value</label>
-        <select id="a-value"><option value="">—</option></select>
-      </div>
-      <div class="mini" id="a-summary"></div>
+  <!-- Action 1: upload. This is the only thing the user must do first, so it
+       leads the panel and nothing else competes with it. -->
+  <div class="card uploader" id="uploader">
+    <div class="card-head">
+      <span class="tag accent">Step 1</span>
+      <h3>Upload a file</h3>
     </div>
-
-    <div class="card">
-      <div class="card-head"><span class="tag blue">B</span><h3>Updated dataset</h3></div>
-      <div class="field">
-        <label>Source</label>
-        <select id="b-source"><option value="">— select —</option></select>
-      </div>
-      <div class="field">
-        <label>Sheet</label>
-        <select id="b-sheet"><option value="">—</option></select>
-      </div>
-      <div class="field">
-        <label>Header row</label>
-        <input id="b-header" type="number" value="1" min="1">
-      </div>
-      <div class="field">
-        <label>Split by column <span class="hint">(optional)</span></label>
-        <select id="b-splitcol"><option value="">— none —</option></select>
-      </div>
-      <div class="field" id="b-value-wrap" style="display:none">
-        <label>Dataset value</label>
-        <select id="b-value"><option value="">—</option></select>
-      </div>
-      <div class="mini" id="b-summary"></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-head"><h3>Add a source</h3></div>
-    <div class="row">
-      <input type="file" id="file-input" accept=".xlsx,.xls,.xlsm,.csv,.tsv">
-      <button class="btn" id="btn-upload">Upload</button>
-    </div>
-    <div class="row">
-      <input type="text" id="path-input" placeholder="…or paste a local file path, e.g. C:\data\impact.xlsx">
-      <button class="btn" id="btn-path">Register path</button>
+    <label class="drop" id="drop" for="file-input">
+      <svg class="drop-icon" viewBox="0 0 24 24" width="30" height="30"
+           fill="none" stroke="currentColor" stroke-width="1.6"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 16V4m0 0L8 8m4-4 4 4"/>
+        <path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+      </svg>
+      <span class="drop-title">Drop an Excel or CSV file here</span>
+      <span class="drop-sub">or <span class="link">choose a file</span> — .xlsx, .xls, .xlsm, .csv, .tsv</span>
+      <input type="file" id="file-input" accept=".xlsx,.xls,.xlsm,.csv,.tsv" hidden>
+    </label>
+    <div class="upload-row">
+      <button class="btn primary" id="btn-upload" disabled>Upload file</button>
+      <span class="file-chip" id="file-chip" hidden></span>
     </div>
     <p class="hint" id="upload-msg"></p>
   </div>
 
+  <!-- Action 2: load. Reads the uploaded file back through the survey-scope
+       questions, so "survey" is shown only when a source has been registered. -->
+  <div class="card loader" id="loader" hidden>
+    <div class="card-head">
+      <span class="tag accent">Step 2</span>
+      <h3>Load the datasets</h3>
+    </div>
+    <p class="card-note">Pick the source on each side, then the sheet and the column
+       that separates the two datasets.</p>
+
+    <div class="grid two">
+      <div class="side">
+        <div class="card-head"><span class="tag green">A</span><h3>Previous dataset</h3></div>
+        <div class="field">
+          <label>Source</label>
+          <select id="a-source"><option value="">— select —</option></select>
+        </div>
+        <div class="field">
+          <label>Sheet</label>
+          <select id="a-sheet"><option value="">—</option></select>
+        </div>
+        <div class="field">
+          <label>Header row</label>
+          <input id="a-header" type="number" value="1" min="1">
+        </div>
+        <div class="field">
+          <label>Split by column <span class="hint">(optional)</span></label>
+          <select id="a-splitcol"><option value="">— none —</option></select>
+        </div>
+        <div class="field" id="a-value-wrap" style="display:none">
+          <label>Dataset value</label>
+          <select id="a-value"><option value="">—</option></select>
+        </div>
+        <div class="mini" id="a-summary"></div>
+      </div>
+
+      <div class="side">
+        <div class="card-head"><span class="tag blue">B</span><h3>Updated dataset</h3></div>
+        <div class="field">
+          <label>Source</label>
+          <select id="b-source"><option value="">— select —</option></select>
+        </div>
+        <div class="field">
+          <label>Sheet</label>
+          <select id="b-sheet"><option value="">—</option></select>
+        </div>
+        <div class="field">
+          <label>Header row</label>
+          <input id="b-header" type="number" value="1" min="1">
+        </div>
+        <div class="field">
+          <label>Split by column <span class="hint">(optional)</span></label>
+          <select id="b-splitcol"><option value="">— none —</option></select>
+        </div>
+        <div class="field" id="b-value-wrap" style="display:none">
+          <label>Dataset value</label>
+          <select id="b-value"><option value="">—</option></select>
+        </div>
+        <div class="mini" id="b-summary"></div>
+      </div>
+    </div>
+  </div>
+
   <div class="actions">
-    <button class="btn primary" id="btn-profile">Probe &amp; profile both datasets →</button>
+    <button class="btn primary" id="btn-profile" disabled>Probe &amp; profile both datasets →</button>
   </div>
 </section>
 

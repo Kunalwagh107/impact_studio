@@ -3,13 +3,21 @@
 Produces the before/after comparison the brief describes, at category level,
 with the blocks visible in the reference layout:
 
-  * Channel / Market block   BEFORE(MAT YA, MAT TY, Growth) x
+  * Market / Channel block   BEFORE(MAT YA, MAT TY, Growth) x
                              AFTER(MAT YA, MAT TY, Growth) +
                              Level Shift(delta pp, share before, share after) +
                              Contribution(share before/after, share of change)
-  * Brand value-share block  BEFORE(MAT YA, MAT TY, share chg) x AFTER(...)
+                             -- one block per level, the Total shown once at
+                             the top and never repeated among its own members
+  * Market / Region block     the same shape, when the user paired regions
   * Manufacturer Top-N       rank before/after, movement class, entered/exited
+                             (selected on the previous dataset, followed into
+                             the updated one)
   * Client brands            tracked independently of Top-N
+
+There is deliberately no brand *value share* block: it was removed on request.
+Brand Top-N and the client-brand tracker remain - they answer different
+questions and neither is a share-of-category presentation.
 
 The whole dataset is aggregated once per dataset and every category report is a
 slice of that aggregation, so a 150-category bulk export does not re-scan the
@@ -286,6 +294,167 @@ def _canonical_category(
     return pd.Series(out, index=dims.index)
 
 
+def resolve_mat_slots(
+    a_prior: str, a_current: str, b_prior: str, b_current: str,
+    df_a: pd.DataFrame, df_b: pd.DataFrame, metric_label: str = "",
+) -> tuple[str, str, str, str]:
+    """Resolve the two period slots the study reads, from the Period columns.
+
+    The single definition of the rule. Both ``prepare`` (through
+    ``_resolve_period_columns``) and the API's pre-flight validation call this,
+    so the columns the run is *checked* against are the columns it *reads*, and
+    the two can never drift apart.
+
+    Each side is resolved against **its own** wired columns and its **own**
+    frame: the two datasets may name the same metric differently (``Sales
+    Value`` on A, ``Value (NT$)`` on B), and passing one side's names for the
+    other silently resolves B against a family it does not have.
+
+    Returns ``(a_prior, a_current, b_prior, b_current)`` - MAT YA and MAT TY on
+    each side. A slot the data cannot supply comes back empty rather than being
+    guessed.
+    """
+    from .profiling import default_period_columns, split_metric_name
+
+    def families(df: pd.DataFrame) -> dict[str, dict[str, str]]:
+        out: dict[str, dict[str, str]] = {}
+        for col in df.columns:
+            if not pd.api.types.is_numeric_dtype(df[col]):
+                continue
+            base, variant = split_metric_name(col)
+            out.setdefault(base, {})[variant or "VALUE"] = col
+        return out
+
+    def resolve(fams: dict[str, dict[str, str]], wired: str,
+                other: str) -> tuple[str, str]:
+        # The base name of whichever wired column this frame actually has. The
+        # wired column may itself be the odd one out (a 2YA), whose base name is
+        # still the family we want. A family dict maps variant -> *column*, so
+        # the test is whether the wired column is one of its values - checking
+        # its keys would compare a column name against variant labels like 'YA'.
+        base = next((base for base, f in fams.items()
+                     if wired in f.values() or other in f.values()), "")
+        fam = fams.get(base, {})
+        if not fam:
+            # The named metric, if the frame has it. This is the fallback that
+            # matters when the client sent no wiring at all - the periods come
+            # from the data, so a blank request is still answerable.
+            fam = fams.get(split_metric_name(metric_label or "")[0], {})
+        if not fam:
+            # Only when *nothing* was asked for by name do we pick a family:
+            # a client that sent neither a metric nor a column. Choosing one
+            # when a specific metric was named would let an unusable metric
+            # silently read a *different* metric's columns - and then the
+            # pre-flight guard could never fire, because everything resolves.
+            if wired or other:
+                return "", ""
+            two = sorted((f for f in fams.values() if len(f) >= 2),
+                         key=lambda f: sorted(f.values())[0])
+            if two:
+                fam = two[0]
+        if not fam:
+            return "", ""
+        return default_period_columns(fam)
+
+    fams_a, fams_b = families(df_a), families(df_b)
+    a_ya, a_ty = resolve(fams_a, a_prior, a_current)
+    b_ya, b_ty = resolve(fams_b, b_prior, b_current)
+    # A slot that resolves on one side and not the other keeps the other side's
+    # column: the two datasets are the same measure, so falling back beats
+    # dropping the period entirely.
+    return (a_ya or "", a_ty or "", b_ya or a_ya or "", b_ty or a_ty or "")
+
+
+def _resolve_period_columns(cfg: AnalysisConfig, df_a: pd.DataFrame,
+                            df_b: pd.DataFrame) -> list[str]:
+    """Point the two period roles at the Period columns, and report what changed.
+
+    The study reads two periods: **MAT YA** and **MAT TY**. Both are already in
+    the data - the metric family carries them as a period qualifier on the column
+    name (``Sales Value YA`` is MAT YA, the unqualified ``Sales Value`` is MAT
+    TY), and the fact table names the same thing in its ``Periods`` column. So
+    the client does not have to declare them, and the run does not depend on it
+    having done so.
+
+    The resolution itself lives in :func:`resolve_mat_slots` - one definition,
+    called by this function, by ``main``'s pre-flight validation and by the
+    analysis, so the columns a run is *checked* against are the columns it
+    *reads*. This function's job is to apply the result to ``cfg`` (in place, so
+    every downstream reader sees it) and to explain any correction.
+
+    Two behaviours matter:
+
+    * **``2YA`` is never a role.** It is a third moving-annual window the study
+      does not use. Treating it as "the prior period" is how an earlier build
+      ended up reading a column two years back and reporting the move as growth.
+    * **A slot that cannot be resolved is cleared and reported, not guessed.**
+      Leaving the incoming value in place would read one column twice and report
+      a plausible 0% everywhere.
+
+    Returns the notes; the caller puts them in ``Prepared.notes``.
+    """
+    msgs: list[str] = []
+
+    a_ya, a_ty, b_ya, b_ty = resolve_mat_slots(
+        cfg.a_prior, cfg.a_current, cfg.b_prior, cfg.b_current,
+        df_a, df_b, cfg.metric_label)
+
+    for side, prior, current, want_ya, want_ty in (
+        ("A", cfg.a_prior, cfg.a_current, a_ya, a_ty),
+        ("B", cfg.b_prior, cfg.b_current, b_ya, b_ty),
+    ):
+        # The resolved value always wins - **including when it is empty**. A slot
+        # the family cannot supply must be *cleared*, not left on whatever
+        # arrived, because the arrival is exactly what might be wrong: a client
+        # sending 2YA as "the year ago" would otherwise keep reading it and the
+        # note would describe a correction that never happened.
+        assign_ya = (lambda v: setattr(cfg, "a_prior", v)) if side == "A" \
+            else (lambda v: setattr(cfg, "b_prior", v))
+        assign_ty = (lambda v: setattr(cfg, "a_current", v)) if side == "A" \
+            else (lambda v: setattr(cfg, "b_current", v))
+
+        if want_ya != prior:
+            if want_ya:
+                msgs.append(
+                    f"Dataset {side}: MAT YA reads '{want_ya}' rather than the "
+                    f"'{prior}' that was wired - the period qualifier on the "
+                    f"metric columns names it, so both periods come from the "
+                    f"Period columns rather than from a second mapping.")
+            assign_ya(want_ya)
+        if want_ty != current:
+            if want_ty:
+                msgs.append(
+                    f"Dataset {side}: MAT TY reads '{want_ty}' rather than the "
+                    f"'{current}' that was wired.")
+            assign_ty(want_ty)
+
+        # A slot the data could not supply at all. Reported plainly: the report
+        # will have an empty period and the reader has to know why.
+        if not want_ya:
+            msgs.append(
+                f"Dataset {side}: no MAT YA column could be resolved - the "
+                f"metric needs a year-ago column (a name ending YA), so "
+                f"before/after growth is not available for this metric.")
+        if not want_ty:
+            msgs.append(
+                f"Dataset {side}: no MAT TY column could be resolved - the "
+                f"metric needs a current-period column (the unqualified name or "
+                f"one ending TY), so the current period is not available.")
+
+    # A degenerate wiring - both roles landing on one column - is still possible
+    # after the above (a single-column family). Left checked here because it is
+    # the one mistake that produces a plausible-looking number: every growth rate
+    # would read 0%, which looks like a flat market rather than a broken one.
+    for side, prior, current in (("A", cfg.a_prior, cfg.a_current),
+                                 ("B", cfg.b_prior, cfg.b_current)):
+        if prior and current and prior == current:
+            msgs.append(
+                f"{side} MAT YA and MAT TY both resolve to '{current}', so growth "
+                f"for {side} is 0% only because the same column was used twice, "
+                f"not because the data is flat.")
+    return msgs
+
+
 def prepare(df_a: pd.DataFrame, df_b: pd.DataFrame, cfg: AnalysisConfig) -> Prepared:
     """Canonicalise both datasets and aggregate to the analysis grain."""
     dim_cols_a = {
@@ -302,7 +471,13 @@ def prepare(df_a: pd.DataFrame, df_b: pd.DataFrame, cfg: AnalysisConfig) -> Prep
         "manufacturer": cfg.col_b("manufacturer_col"),
         "brand": cfg.col_b("brand_col"),
     }
-    notes: list[str] = []
+    # Resolve the two period slots the study reads - MAT YA and MAT TY - from
+    # the Metric Period columns, rewriting cfg in place so everything
+    # downstream (this function, the QC, the exports) reads the same pair. The
+    # notes say which column each slot landed on and flag the degenerate cases,
+    # so a period wiring that cannot work is visible rather than showing up as a
+    # plausible-looking 0% growth.
+    notes: list[str] = list(_resolve_period_columns(cfg, df_a, df_b))
 
     a_dims = _canonicalise(df_a, cfg.mapping_a, dim_cols_a)
     b_dims = _canonicalise(df_b, cfg.mapping_b, dim_cols_b)
@@ -790,16 +965,44 @@ def category_report(prep: Prepared, category: str) -> dict:
         prep.baseline_n_categories,
     )
 
-    # Market / channel block --------------------------------------------------
+    # Market block ------------------------------------------------------------
+    #
+    # The market dimension is a hierarchy, and the levels answer different
+    # questions, so they are reported as **separate blocks**: a Market/Channel
+    # block (the Total, then the channels beneath it) and a Market/Region block
+    # (the Total, then the regions beneath it). Laying them in one flat block
+    # would put the Total next to its own parts, which double-counts it and makes
+    # every share in the block wrong. The Total is emitted once at the top of
+    # each block and **removed from the member rows**, because the members are
+    # already shown beneath it - repeating the total as a member row would count
+    # it a second time in any sum a reader performs.
     if cfg.market_col:
-        mkt = _entity_block(a, b, "market", cfg.is_rate, wcol, cfg.metric_label,
-                            base_a, base_b, cfg.growth_applicable)
-        mkt = mkt.sort_values("b_current", ascending=False, na_position="last")
-        report["blocks"]["market"] = [ _record(r, "market", "market") for _, r in mkt.iterrows() ]
-        # level shift + contribution columns for the reference layout
-        report["channel_block"] = [
-            {
+        mkt_all = _entity_block(a, b, "market", cfg.is_rate, wcol, cfg.metric_label,
+                                base_a, base_b, cfg.growth_applicable)
+        mkt_all = mkt_all.sort_values("b_current", ascending=False, na_position="last")
+        # `market_levels` is the user's authored pairing level, so the split
+        # follows their decision rather than a classification the app made. A
+        # market with no recorded level is still reported, in the unscoped block,
+        # so nothing authored silently disappears from the analysis.
+        levels = {str(k): str(v or "").lower() for k, v in (cfg.market_levels or {}).items()}
+        baseline_name_a = (cfg.baseline_market or "").strip()
+        baseline_name_b = (cfg.baseline_market_b or baseline_name_a).strip()
+        total_rows = [
+            r for _, r in mkt_all.iterrows()
+            if str(r["market"]) in (baseline_name_a, baseline_name_b)
+            or levels.get(str(r["market"])) == "total"
+        ]
+        # One Total row, preferring the A-side name, carried into the block head.
+        total_row = total_rows[0] if total_rows else None
+        member_rows = [
+            r for _, r in mkt_all.iterrows()
+            if r is not total_row and levels.get(str(r["market"])) != "total"
+        ]
+
+        def _channel_entry(r: pd.Series) -> dict:
+            return {
                 "name": r["market"],
+                "level": levels.get(str(r["market"])) or "unscoped",
                 "before": {
                     "mat_ya": _f(r["a_prior"]), "mat_ty": _f(r["a_current"]),
                     "growth_pct": _f(r["before_growth_pct"]),
@@ -820,8 +1023,40 @@ def category_report(prep: Prepared, category: str) -> dict:
                 },
                 "abs_change": _f(r["abs_change"]),
             }
-            for _, r in mkt.iterrows()
-        ]
+
+        # The Total, once, for the head of every block that has members.
+        total_entry = _channel_entry(total_row) if total_row is not None else None
+
+        def _block_for(want: str) -> dict | None:
+            rows = [r for r in member_rows if levels.get(str(r["market"])) == want]
+            if not rows:
+                return None
+            return {
+                "level": want,
+                "total": total_entry,
+                "members": [_channel_entry(r) for r in rows],
+            }
+
+        channel_block = _block_for("channel")
+        region_block = _block_for("region")
+        # Anything the user paired but did not level, so it is not silently lost.
+        other_block = _block_for("") or None
+        if not other_block:
+            loose = [r for r in member_rows if not levels.get(str(r["market"]))]
+            if loose:
+                other_block = {"level": "unscoped", "total": total_entry,
+                               "members": [_channel_entry(r) for r in loose]}
+
+        report["blocks"]["channel"] = channel_block
+        report["blocks"]["region"] = region_block
+        report["blocks"]["market_other"] = other_block
+
+        # `channel_block` stays the flat, most-complete list the exports and the
+        # QC read, and it keeps the Total first so a share in it is never
+        # ambiguous. The per-level blocks above are for the UI's side-by-side
+        # presentation.
+        flat = ([total_row] if total_row is not None else []) + member_rows
+        report["channel_block"] = [_channel_entry(r) for r in flat]
 
     # Subcategory block (when the dimension exists) ---------------------------
     if cfg.subcategory_col:
@@ -831,31 +1066,8 @@ def category_report(prep: Prepared, category: str) -> dict:
         sub = sub.sort_values("b_current", ascending=False, na_position="last")
         report["blocks"]["subcategory"] = [_record(r, "subcategory", "subcategory") for _, r in sub.iterrows()]
 
-    # Brand block -------------------------------------------------------------
-    if cfg.brand_col:
-        br = _entity_block(a, b, "brand", cfg.is_rate, wcol, cfg.metric_label,
-                           growth_applicable=cfg.growth_applicable)
-        br = br[br["brand"].astype(str).str.len() > 0]
-        br = br.sort_values("b_current", ascending=False, na_position="last")
-        report["brand_block"] = [
-            {
-                "name": r["brand"],
-                "before": {
-                    "mat_ya": _f(r["a_prior"]), "mat_ty": _f(r["a_current"]),
-                    "growth_pct": _f(r["before_growth_pct"]),
-                    "share_pct": _f(r["before_share_pct"]),
-                    "share_chg_pp": _f(r["share_change_pp"]),
-                },
-                "after": {
-                    "mat_ya": _f(r["b_prior"]), "mat_ty": _f(r["b_current"]),
-                    "growth_pct": _f(r["after_growth_pct"]),
-                    "share_pct": _f(r["after_share_pct"]),
-                },
-                "abs_change": _f(r["abs_change"]),
-                "contribution_to_change_pct": _f(r["contribution_to_change_pct"]),
-            }
-            for _, r in br.iterrows()
-        ]
+    # Brand value share was removed on request, so no `brand_block` is emitted.
+    # Brand Top-N (below) and the client-brand tracker are separate and remain.
 
     # Manufacturer / brand Top-N ---------------------------------------------
     if cfg.manufacturer_col:
