@@ -22,11 +22,18 @@ PY="C:/Program Files/Python312/python.exe"
 #    the OLD server still holding 8777, which is running pre-edit code. That
 #    produced a run where every check failed and the served route was 404 -
 #    reading as a broken app rather than a stale one.
-PORT=8777
+#
+#    `PORT=8787 bash _run_drive.sh` picks another port. Needed whenever the user
+#    has their own `python run.py` up: that instance is running whatever code it
+#    started with, so driving it would test the wrong build - and killing it
+#    would close the app they are looking at.
+PORT="${PORT:-8777}"
 if netstat -ano -p TCP 2>/dev/null | grep LISTENING | grep -q ":$PORT "; then
   echo "PORT $PORT IS ALREADY IN USE - refusing to start."
   echo "A previous run's server is still up; run.py would silently fall back to"
   echo "a second port and this script would then drive the STALE server."
+  echo "If it is your own 'python run.py', restart it (to pick up backend edits)"
+  echo "and re-run with:  PORT=8787 bash $0"
   netstat -ano -p TCP 2>/dev/null | grep LISTENING | grep ":$PORT "
   echo "Kill it (taskkill //F //PID <pid>) and re-run."
   exit 1
@@ -70,20 +77,37 @@ curl -s -m 3 --noproxy '*' http://127.0.0.1:$PORT/api/memory > "$RUN/api_health.
   || echo "API NOT ANSWERING - failures below are not findings" 
 
 # 2. chrome
+#    The debug port must also be ours. If something already holds it, this
+#    Chrome fails to bind and the probe attaches to *that* browser instead.
+CDP_PORT="${CDP_PORT:-9222}"
+if netstat -ano -p TCP 2>/dev/null | grep LISTENING | grep -q ":$CDP_PORT "; then
+  echo "DEBUG PORT $CDP_PORT IS ALREADY IN USE - refusing to start."
+  echo "Re-run with:  CDP_PORT=9333 PORT=8787 bash $0"
+  exit 1
+fi
 rm -rf "$RUN/chrome-profile"
-"$CHROME" --headless=new --disable-gpu --remote-debugging-port=9222 \
+"$CHROME" --headless=new --disable-gpu --remote-debugging-port=$CDP_PORT \
   --user-data-dir="C:/Users/kunal/OneDrive/Desktop/impact/impact_studio/tools/ui_probe/_run/chrome-profile" \
   --no-first-run --no-default-browser-check --hide-scrollbars about:blank \
   > "$RUN/chrome.log" 2>&1 &
 CHR=$!
 for i in $(seq 1 30); do
-  if curl -s -m 2 --noproxy '*' http://127.0.0.1:9222/json/version >/dev/null 2>&1; then
+  if curl -s -m 2 --noproxy '*' http://127.0.0.1:$CDP_PORT/json/version >/dev/null 2>&1; then
     echo "chrome UP after ${i}s"; break
   fi
   sleep 1
 done
 
-# 3. the full seven-step driver
+# 3. the full seven-step driver.
+#    The probe defaults to 127.0.0.1:8777 when APP_URL is unset. With the user's
+#    own `python run.py` up, that silently drove THEIR instance - running
+#    pre-edit code - while this script's server sat idle on $PORT. It is the same
+#    stale-server trap the port guard above exists to stop, arriving by another
+#    route, and it reads as a product bug: the probe reported an old message from
+#    a build that was never the one under test. Name the target explicitly.
+export APP_URL="http://127.0.0.1:$PORT"
+export CDP_URL="http://127.0.0.1:$CDP_PORT"
+echo "driving APP_URL=$APP_URL via CDP_URL=$CDP_URL"
 cd tools/ui_probe || exit 1
 "$NODE" drive.mjs "_run/shots" > "_run/drive.out" 2>&1
 echo "DRIVE EXIT=$?"

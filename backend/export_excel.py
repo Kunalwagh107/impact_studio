@@ -148,7 +148,7 @@ def build_category_workbook(
         _sheet_clients(wb, f, report, cat, metric, mkt_label)
     if report.get("contributors"):
         _sheet_contributors(wb, f, report, cat, metric, mkt_label)
-    _sheet_qc(wb, f, qc, cat)
+    _sheet_qc(wb, f, qc, cat, meta)
 
     wb.close()
     return out_path
@@ -536,11 +536,14 @@ def _sheet_ranked(wb, f, block, title, cat, metric, mkt_label):
                    "Selected as the largest in the previous dataset, followed into "
                    "the updated one", f["subtitle"])
     r = 3
-    # Column order: Entity, MAT YA, MAT TY, Before, After, Share change, then the
-    # ranks. This is the Market Regions layout, so the two tables read the same
-    # way. Growth is deliberately absent: for a ranked entity the share change is
-    # the comparable movement, and a growth column here was the odd one out.
-    headers = ["Entity", "MAT YA", "MAT TY", "Before", "After", "Share change",
+    # Column order: Entity, then the MAT YA / MAT TY levels of BEFORE and AFTER,
+    # then the share change, then the ranks. This is the Market Regions layout, so
+    # the two tables read the same way - the levels lead and the rank is the
+    # consequence of the movement rather than the headline. Growth is
+    # deliberately absent: for a ranked entity the share change is the comparable
+    # movement, and a growth column here was the odd one out.
+    headers = ["Entity", "BEFORE MAT YA", "BEFORE MAT TY", "AFTER MAT YA",
+               "AFTER MAT TY", "Share change",
                "Rank BEFORE", "Rank AFTER", "Rank change", "Movement"]
     for i, h in enumerate(headers):
         ws.write(r, i, h, f["hdr_grey"])
@@ -548,10 +551,10 @@ def _sheet_ranked(wb, f, block, title, cat, metric, mkt_label):
 
     for b in block:
         ws.write(r, 0, b["name"], f["label"])
-        # MAT YA / MAT TY are the BEFORE side's prior and current periods - the
-        # same source the Market Regions block reads (`mat_ya` / `mat_ty`).
+        # MAT YA / MAT TY on each side are that side's prior and current periods -
+        # the same source the Market Regions block reads (`mat_ya` / `mat_ty`).
         values = [(1, b.get("before_prior")), (2, b.get("before_current")),
-                  (3, b.get("before_current")), (4, b.get("after_current"))]
+                  (3, b.get("after_prior")), (4, b.get("after_current"))]
         for col, v in values:
             if v is not None:
                 ws.write_number(r, col, v / scale, f["val2"])
@@ -571,9 +574,10 @@ def _sheet_ranked(wb, f, block, title, cat, metric, mkt_label):
                        "there), then each followed into the updated one - so an entity that "
                        "led before and shrank after still appears, at the top.",
              f["note"])
-    ws.write(r + 2, 0, "MAT YA / MAT TY are the previous dataset's MAT; Before / After are "
-                       "the category level in each dataset with share change of the "
-                       "category total. No growth column, matching the Market Regions block.",
+    ws.write(r + 2, 0, "MAT YA / MAT TY are each side's own MAT - the previous dataset's "
+                       "under BEFORE and the updated one's under AFTER. Share change is of "
+                       "the category total. No growth column, matching the Market Regions "
+                       "block.",
              f["note"])
     ws.write(r + 3, 0, "Movement: NEW = only in the updated dataset, EXITED = only in the "
                        "previous dataset, GAINED/LOST = rank improved/declined, HELD = unchanged.",
@@ -661,7 +665,7 @@ def _sheet_contributors(wb, f, report, cat, metric, mkt_label):
         r += 1
 
 
-def _sheet_qc(wb, f, qc, cat):
+def _sheet_qc(wb, f, qc, cat, meta=None):
     ws = wb.add_worksheet("QC")
     ws.set_column("A:A", 28)
     ws.set_column("B:B", 10)
@@ -688,3 +692,18 @@ def _sheet_qc(wb, f, qc, cat):
     ws.write(r, 0, "Totals", f["label_b"])
     ws.write(r, 1, f"PASS {counts.get('PASS', 0)} / WARN {counts.get('WARN', 0)} / "
                    f"FAIL {counts.get('FAIL', 0)}", f["label"])
+
+    # What the run did to the data - chiefly how much of it is in scope. Recorded
+    # in the deliverable so a reader of the workbook knows the coverage without
+    # having to be told. Deliberately below the checks and not counted as one:
+    # these are statements of fact, not verifications, so folding them into the
+    # totals would misstate how many checks passed.
+    notes = [n for n in (meta or {}).get("run_notes") or [] if n]
+    if notes:
+        r += 2
+        ws.write(r, 0, "Run notes", f["label_b"])
+        r += 1
+        for n in notes:
+            ws.write(r, 0, "•", f["label"])
+            ws.write(r, 1, n, f["wrap"])
+            r += 1

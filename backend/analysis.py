@@ -32,6 +32,16 @@ from typing import Any, Sequence
 import numpy as np
 import pandas as pd
 
+from .profiling import (
+    MAT_TY,
+    MAT_YA,
+    classify_period_value,
+    default_period_columns,
+    detect_period_column,
+    period_slots_present,
+    split_metric_name,
+)
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
@@ -136,6 +146,11 @@ def _aggregate(
 
     ``value_cols`` maps output name -> source column, e.g.
     {'prior': 'Sales Value YA', 'current': 'Sales Value'}.
+
+    ``weight_col`` is either one column name serving both slots, or a
+    ``{slot: column}`` map for a row-based fact table where each period's rows
+    carry their own weight. Getting this wrong on such a frame is silent: the
+    denominator sums both periods and every rate comes back halved.
     """
     # An empty input still has to carry the group columns. Callers merge two
     # aggregated frames on those columns (``_entity_block`` does
@@ -159,12 +174,16 @@ def _aggregate(
         # as a REGEX, so the two-character "||" matched either bar and a value of
         # "M1" came back as ["M", "1", None, None] - four columns where one was
         # expected, which then failed the `keys.columns = use` assignment.
-        w = d[weight_col] if weight_col and weight_col in d.columns else None
         parts = []
         for out_name, col in value_cols.items():
             if col not in d.columns:
                 continue
             x = pd.to_numeric(d[col], errors="coerce")
+            # A per-slot weight map: the row-based convention masks each slot's
+            # weight by its own period, so the denominator cannot include the
+            # other period's rows.
+            wname = weight_col.get(out_name) if isinstance(weight_col, dict) else weight_col
+            w = d[wname] if wname and wname in d.columns else None
             tmp = d[use].copy()
             if w is not None:
                 ww = pd.to_numeric(w, errors="coerce")
@@ -294,9 +313,79 @@ def _canonical_category(
     return pd.Series(out, index=dims.index)
 
 
+def _period_column(df: pd.DataFrame, wired: str = "") -> str:
+    """The column whose values name the study's two periods, on one frame.
+
+    The wired period dimension when it carries MAT YA / MAT TY, otherwise the
+    column the frame itself offers. The periods are resolved from the data, so a
+    client that sent no period column must not make the row-based convention
+    unreachable.
+    """
+    return detect_period_column(df, wired or "")
+
+
+def period_discriminates(df: pd.DataFrame, period_col: str,
+                         prior_col: str, current_col: str) -> bool:
+    """True when the *rows*, not the column name, tell the two periods apart.
+
+    Both slots landing on one column is normally a wiring fault - the same
+    measure read twice, so every growth rate reads 0% and looks like a flat
+    market. It is legitimate in exactly one case: a fact table whose ``Periods``
+    column carries both MAT YA and MAT TY as separate rows. This is the single
+    definition of that case, used both to apply the period filter in
+    :func:`prepare` and to suppress the degenerate-wiring warning.
+    """
+    if not prior_col or prior_col != current_col:
+        return False
+    slots = period_slots_present(df, _period_column(df, period_col))
+    return MAT_YA in slots and MAT_TY in slots
+
+
+def _period_mask(df: pd.DataFrame, period_col: str,
+                 period_value: str) -> pd.Series:
+    """Boolean row mask for one period. All-True when no period is named.
+
+    An empty ``period_value`` means the column-name convention, where the row
+    set needs no restriction - the column *is* the period. Returning an all-True
+    mask rather than ``None`` lets every caller apply it unconditionally.
+    """
+    if not period_value or not period_col or period_col not in df.columns:
+        return pd.Series(True, index=df.index)
+    return df[period_col].map(classify_period_value) == period_value
+
+
+def _slot_series(df: pd.DataFrame, col: str, period_value: str,
+                 period_col: str) -> pd.Series | float:
+    """One period's values: the metric column, restricted to that period's rows.
+
+    ``period_value`` is empty for the column-name convention, where the row set
+    needs no restriction - the column *is* the period.
+    """
+    if not col or col not in df.columns:
+        return np.nan
+    x = pd.to_numeric(df[col], errors="coerce")
+    if not period_value or not period_col or period_col not in df.columns:
+        return x
+    return x.where(_period_mask(df, period_col, period_value))
+
+
+def _weight_map(frame: pd.DataFrame) -> str | dict[str, str] | None:
+    """The weight column(s) an aggregation should use for each slot.
+
+    A plain column name when one weight serves both slots (the column-name
+    convention), or ``{slot: column}`` when each period's rows carry their own
+    weight (the row-based convention, where an unmasked denominator would
+    average the other period in and halve the rate).
+    """
+    if "weight_prior" in frame.columns and "weight_current" in frame.columns:
+        return {"prior": "weight_prior", "current": "weight_current"}
+    return "weight" if "weight" in frame.columns else None
+
+
 def resolve_mat_slots(
     a_prior: str, a_current: str, b_prior: str, b_current: str,
     df_a: pd.DataFrame, df_b: pd.DataFrame, metric_label: str = "",
+    period_col_a: str = "", period_col_b: str = "",
 ) -> tuple[str, str, str, str]:
     """Resolve the two period slots the study reads, from the Period columns.
 
@@ -310,12 +399,23 @@ def resolve_mat_slots(
     Value`` on A, ``Value (NT$)`` on B), and passing one side's names for the
     other silently resolves B against a family it does not have.
 
-    Returns ``(a_prior, a_current, b_prior, b_current)`` - MAT YA and MAT TY on
-    each side. A slot the data cannot supply comes back empty rather than being
-    guessed.
-    """
-    from .profiling import default_period_columns, split_metric_name
+    **Where the periods come from.** Two workbook conventions exist and both
+    must work:
 
+    * **wide** - the periods are columns. ``Sales Value YA`` is MAT YA and the
+      unqualified ``Sales Value`` is MAT TY, so each slot names its own column.
+    * **long** - the periods are rows. There is one metric column and the fact
+      table's ``Periods`` column says which period each row is. A slot the
+      family cannot name is then supplied by the *same* metric column, read
+      twice and restricted to that period's rows by :func:`prepare`.
+
+    A slot neither convention can supply comes back empty rather than being
+    guessed, so the caller reports it instead of reading a column twice and
+    presenting a plausible 0%.
+
+    Returns ``(a_prior, a_current, b_prior, b_current)`` - MAT YA and MAT TY on
+    each side.
+    """
     def families(df: pd.DataFrame) -> dict[str, dict[str, str]]:
         out: dict[str, dict[str, str]] = {}
         for col in df.columns:
@@ -326,7 +426,7 @@ def resolve_mat_slots(
         return out
 
     def resolve(fams: dict[str, dict[str, str]], wired: str,
-                other: str) -> tuple[str, str]:
+                other: str, df: pd.DataFrame, period_col: str) -> tuple[str, str]:
         # The base name of whichever wired column this frame actually has. The
         # wired column may itself be the odd one out (a 2YA), whose base name is
         # still the family we want. A family dict maps variant -> *column*, so
@@ -354,11 +454,20 @@ def resolve_mat_slots(
                 fam = two[0]
         if not fam:
             return "", ""
-        return default_period_columns(fam)
+        ya, ty = default_period_columns(fam)
+        # The measure a row-based slot is read from: the current-period column,
+        # never the 2YA window the study does not use.
+        metric_col = ty or next((v for k, v in fam.items() if k != "2YA"), "")
+        slots = period_slots_present(df, _period_column(df, period_col))
+        if not ya and MAT_YA in slots and metric_col:
+            ya = metric_col
+        if not ty and MAT_TY in slots and metric_col:
+            ty = metric_col
+        return ya, ty
 
     fams_a, fams_b = families(df_a), families(df_b)
-    a_ya, a_ty = resolve(fams_a, a_prior, a_current)
-    b_ya, b_ty = resolve(fams_b, b_prior, b_current)
+    a_ya, a_ty = resolve(fams_a, a_prior, a_current, df_a, period_col_a)
+    b_ya, b_ty = resolve(fams_b, b_prior, b_current, df_b, period_col_b)
     # A slot that resolves on one side and not the other keeps the other side's
     # column: the two datasets are the same measure, so falling back beats
     # dropping the period entirely.
@@ -370,11 +479,18 @@ def _resolve_period_columns(cfg: AnalysisConfig, df_a: pd.DataFrame,
     """Point the two period roles at the Period columns, and report what changed.
 
     The study reads two periods: **MAT YA** and **MAT TY**. Both are already in
-    the data - the metric family carries them as a period qualifier on the column
-    name (``Sales Value YA`` is MAT YA, the unqualified ``Sales Value`` is MAT
-    TY), and the fact table names the same thing in its ``Periods`` column. So
-    the client does not have to declare them, and the run does not depend on it
-    having done so.
+    the data, in one of two shapes:
+
+    * the metric family carries them as a period qualifier on the column name
+      (``Sales Value YA`` is MAT YA, the unqualified ``Sales Value`` is MAT TY);
+    * the fact table carries them as **rows**, in its ``Periods`` column, over a
+      single metric column - so the two slots are the same column read twice,
+      each restricted to its own period's rows.
+
+    Either way the client does not have to declare them, and the run does not
+    depend on it having done so. A workbook with no year-ago column at all is
+    answered from the period rows; one with neither is reported, not refused on
+    the strength of a column name it was never going to have.
 
     The resolution itself lives in :func:`resolve_mat_slots` - one definition,
     called by this function, by ``main``'s pre-flight validation and by the
@@ -395,13 +511,22 @@ def _resolve_period_columns(cfg: AnalysisConfig, df_a: pd.DataFrame,
     """
     msgs: list[str] = []
 
+    # Pin the period dimension to the column the frame actually offers, so the
+    # row-based slots resolve and the QC's duplicate check keys on the real
+    # grain. The wired name is honoured when it carries the periods; otherwise
+    # the data supplies one.
+    for side, df, attr in (("a", df_a, "period_col"), ("b", df_b, "period_col_b")):
+        col = _period_column(df, getattr(cfg, attr, ""))
+        if col:
+            setattr(cfg, attr, col)
+
     a_ya, a_ty, b_ya, b_ty = resolve_mat_slots(
         cfg.a_prior, cfg.a_current, cfg.b_prior, cfg.b_current,
-        df_a, df_b, cfg.metric_label)
+        df_a, df_b, cfg.metric_label, cfg.period_col, cfg.period_col_b)
 
-    for side, prior, current, want_ya, want_ty in (
-        ("A", cfg.a_prior, cfg.a_current, a_ya, a_ty),
-        ("B", cfg.b_prior, cfg.b_current, b_ya, b_ty),
+    for side, prior, current, want_ya, want_ty, df, pcol in (
+        ("A", cfg.a_prior, cfg.a_current, a_ya, a_ty, df_a, cfg.period_col),
+        ("B", cfg.b_prior, cfg.b_current, b_ya, b_ty, df_b, cfg.period_col_b),
     ):
         # The resolved value always wins - **including when it is empty**. A slot
         # the family cannot supply must be *cleared*, not left on whatever
@@ -413,13 +538,22 @@ def _resolve_period_columns(cfg: AnalysisConfig, df_a: pd.DataFrame,
         assign_ty = (lambda v: setattr(cfg, "a_current", v)) if side == "A" \
             else (lambda v: setattr(cfg, "b_current", v))
 
+        # Both slots on one column is only a fault when nothing else separates
+        # them. On a row-based fact table the Periods column does, and saying so
+        # is the whole point of reading the periods from the rows.
+        row_based = period_discriminates(df, pcol, want_ya, want_ty)
+
         if want_ya != prior:
             if want_ya:
                 msgs.append(
                     f"Dataset {side}: MAT YA reads '{want_ya}' rather than the "
-                    f"'{prior}' that was wired - the period qualifier on the "
-                    f"metric columns names it, so both periods come from the "
-                    f"Period columns rather than from a second mapping.")
+                    f"'{prior}' that was wired"
+                    + (f" - the '{pcol}' column carries MAT YA as its own rows, "
+                       f"so the two periods come from the Period column rather "
+                       f"than from a second mapping." if row_based else
+                       " - the period qualifier on the metric columns names it, "
+                       "so both periods come from the Period columns rather "
+                       "than from a second mapping."))
             assign_ya(want_ya)
         if want_ty != current:
             if want_ty:
@@ -429,25 +563,31 @@ def _resolve_period_columns(cfg: AnalysisConfig, df_a: pd.DataFrame,
             assign_ty(want_ty)
 
         # A slot the data could not supply at all. Reported plainly: the report
-        # will have an empty period and the reader has to know why.
+        # will have an empty period and the reader has to know why. This is not
+        # a refusal - the other period still runs, and on a row-based workbook
+        # the absent one is genuinely absent rather than mis-named.
         if not want_ya:
             msgs.append(
-                f"Dataset {side}: no MAT YA column could be resolved - the "
-                f"metric needs a year-ago column (a name ending YA), so "
-                f"before/after growth is not available for this metric.")
+                f"Dataset {side}: no MAT YA could be resolved - the metric has "
+                f"no year-ago column (a name ending YA) and the '{pcol or 'period'}' "
+                f"column carries no MAT YA rows, so before/after growth is not "
+                f"available for this metric.")
         if not want_ty:
             msgs.append(
-                f"Dataset {side}: no MAT TY column could be resolved - the "
-                f"metric needs a current-period column (the unqualified name or "
-                f"one ending TY), so the current period is not available.")
+                f"Dataset {side}: no MAT TY could be resolved - the metric has "
+                f"no current-period column (the unqualified name or one ending "
+                f"TY) and the '{pcol or 'period'}' column carries no MAT TY rows, "
+                f"so the current period is not available.")
 
     # A degenerate wiring - both roles landing on one column - is still possible
-    # after the above (a single-column family). Left checked here because it is
-    # the one mistake that produces a plausible-looking number: every growth rate
-    # would read 0%, which looks like a flat market rather than a broken one.
-    for side, prior, current in (("A", cfg.a_prior, cfg.a_current),
-                                 ("B", cfg.b_prior, cfg.b_current)):
-        if prior and current and prior == current:
+    # after the above (a single-column family with nothing to separate the two
+    # periods). Left checked here because it is the one mistake that produces a
+    # plausible-looking number: every growth rate would read 0%, which looks like
+    # a flat market rather than a broken one.
+    for side, prior, current, df, pcol in (("A", cfg.a_prior, cfg.a_current, df_a, cfg.period_col),
+                                           ("B", cfg.b_prior, cfg.b_current, df_b, cfg.period_col_b)):
+        if prior and current and prior == current \
+                and not period_discriminates(df, pcol, prior, current):
             msgs.append(
                 f"{side} MAT YA and MAT TY both resolve to '{current}', so growth "
                 f"for {side} is 0% only because the same column was used twice, "
@@ -487,30 +627,66 @@ def prepare(df_a: pd.DataFrame, df_b: pd.DataFrame, cfg: AnalysisConfig) -> Prep
         b_dims, cfg.category_map_b, cfg.category_excluded_b)
 
     # --- dataset A -----------------------------------------------------------
+    #
+    # Each slot is the metric column restricted to its own period's rows. On a
+    # workbook whose periods are columns the restriction is empty and the column
+    # *is* the period; on one whose periods are rows both slots read the same
+    # metric column and the Periods column separates them. Applying the filter
+    # only when the period actually discriminates keeps the column-name
+    # convention byte-for-byte unchanged.
+    a_row_based = period_discriminates(df_a, cfg.period_col, cfg.a_prior, cfg.a_current)
+    a_prior_p = MAT_YA if a_row_based else ""
+    a_current_p = MAT_TY if a_row_based else ""
+
     a = a_dims.copy()
-    a["prior"] = pd.to_numeric(df_a[cfg.a_prior], errors="coerce") if cfg.a_prior in df_a else np.nan
-    a["current"] = pd.to_numeric(df_a[cfg.a_current], errors="coerce") if cfg.a_current in df_a else np.nan
+    a["prior"] = _slot_series(df_a, cfg.a_prior, a_prior_p, cfg.period_col)
+    a["current"] = _slot_series(df_a, cfg.a_current, a_current_p, cfg.period_col)
     # A rate metric is averaged. With no weight column we fall back to an
     # unweighted mean - never to the rate weighting itself, which is meaningless.
+    # The weight is masked exactly like its slot: on a row-based frame a row's
+    # weight belongs to that row's period, so an unmasked denominator would
+    # average in the other period and halve the rate.
     if cfg.is_rate and cfg.weight_metric and cfg.weight_metric in df_a.columns:
-        a["weight"] = pd.to_numeric(df_a[cfg.weight_metric], errors="coerce")
+        w = pd.to_numeric(df_a[cfg.weight_metric], errors="coerce")
+        a["weight"] = w
+        a["weight_prior"] = w.where(_period_mask(df_a, cfg.period_col, a_prior_p))
+        a["weight_current"] = w.where(_period_mask(df_a, cfg.period_col, a_current_p))
     a["__ds"] = "A"
 
     # --- dataset B -----------------------------------------------------------
+    b_row_based = period_discriminates(df_b, cfg.period_col_b, cfg.b_prior, cfg.b_current)
+    b_prior_p = MAT_YA if b_row_based else ""
+    b_current_p = MAT_TY if b_row_based else ""
+
     b = b_dims.copy()
-    b["prior"] = pd.to_numeric(df_b[cfg.b_prior], errors="coerce") if cfg.b_prior in df_b else np.nan
-    b["current"] = pd.to_numeric(df_b[cfg.b_current], errors="coerce") if cfg.b_current in df_b else np.nan
+    b["prior"] = _slot_series(df_b, cfg.b_prior, b_prior_p, cfg.period_col_b)
+    b["current"] = _slot_series(df_b, cfg.b_current, b_current_p, cfg.period_col_b)
     wb = cfg.weight_metric_b or cfg.weight_metric
     if cfg.is_rate and wb and wb in df_b.columns:
-        b["weight"] = pd.to_numeric(df_b[wb], errors="coerce")
+        w = pd.to_numeric(df_b[wb], errors="coerce")
+        b["weight"] = w
+        b["weight_prior"] = w.where(_period_mask(df_b, cfg.period_col_b, b_prior_p))
+        b["weight_current"] = w.where(_period_mask(df_b, cfg.period_col_b, b_current_p))
     b["__ds"] = "B"
 
     dropped_a = int(a["category"].isna().sum())
     dropped_b = int(b["category"].isna().sum())
     if dropped_a or dropped_b:
+        # A *scope* statement, not a fault. A row whose category was left unmapped
+        # (or explicitly excluded) has no counterpart to compare against, so it
+        # cannot contribute an impact figure - but "80437 rows dropped" reads as
+        # data loss. Give the denominator and say what the figures cover, so the
+        # reader can judge the coverage instead of distrusting the run.
+        dropped = dropped_a + dropped_b
+        total = len(a) + len(b)
+        share = dropped / total * 100
+        # A share that rounds to 0.0% reads as a rounding error; say "<0.1%".
+        pct = "<0.1%" if share < 0.05 else f"{share:.1f}%"
         notes.append(
-            f"{dropped_a + dropped_b} row(s) dropped because their category was "
-            "excluded in the category mapping."
+            f"{total - dropped:,} of {total:,} rows are in categories you mapped. "
+            f"The other {dropped:,} ({pct}) are in categories left unmapped or "
+            f"excluded, so they are outside this analysis - add a mapping for them "
+            f"in step 4 to bring them in."
         )
     a = a[a["category"].notna()]
     b = b[b["category"].notna()]
@@ -525,11 +701,10 @@ def prepare(df_a: pd.DataFrame, df_b: pd.DataFrame, cfg: AnalysisConfig) -> Prep
     # the counterpart name. Without it, a baseline named only on the A side would
     # be silently unverified on B.
     baseline_name_b = (cfg.baseline_market_b or baseline_name).strip()
-    wcol_a = "weight" if "weight" in a.columns else None
-    wcol_b = "weight" if "weight" in b.columns else None
+    wcol_a = _weight_map(a)
+    wcol_b = _weight_map(b)
     if baseline_name:
-        def _base(frame: pd.DataFrame, wcol: str | None,
-                  name: str) -> dict[str, tuple]:
+        def _base(frame: pd.DataFrame, wcol, name: str) -> dict[str, tuple]:
             sub = frame[frame["market"].astype(str) == name]
             if sub.empty:
                 return {}
@@ -627,8 +802,11 @@ def _entity_block(
     brief asks for.
     """
     vcols = {"prior": "prior", "current": "current"}
-    ga = _aggregate(a, [dim], vcols, is_rate, weight_col)
-    gb = _aggregate(b, [dim], vcols, is_rate, weight_col)
+    # Resolved per frame: a row-based fact table carries a weight per period, so
+    # the same slot on A and B may need a different weight column. `weight_col`
+    # stays as the caller's fallback for a frame with no weight of its own.
+    ga = _aggregate(a, [dim], vcols, is_rate, _weight_map(a) or weight_col)
+    gb = _aggregate(b, [dim], vcols, is_rate, _weight_map(b) or weight_col)
     ga = ga.rename(columns={"prior": "a_prior", "current": "a_current"})
     gb = gb.rename(columns={"prior": "b_prior", "current": "b_current"})
     m = ga.merge(gb, on=dim, how="outer").fillna({dim: ""})
@@ -909,12 +1087,23 @@ def category_report(prep: Prepared, category: str) -> dict:
         "rows_after": int(len(b)),
     }
     if cfg.is_rate:
-        wa = a["weight"] if "weight" in a else None
-        wb = b["weight"] if "weight" in b else None
-        tot["before_prior"] = _f((a["prior"] * wa).sum() / wa.sum()) if wa is not None and wa.sum() else None
-        tot["before_current"] = _f((a["current"] * wa).sum() / wa.sum()) if wa is not None and wa.sum() else None
-        tot["after_prior"] = _f((b["prior"] * wb).sum() / wb.sum()) if wb is not None and wb.sum() else None
-        tot["after_current"] = _f((b["current"] * wb).sum() / wb.sum()) if wb is not None and wb.sum() else None
+        def _rate_total(frame: pd.DataFrame, slot: str) -> float | None:
+            # The weight that belongs to *this* slot. On a row-based fact table
+            # each period's rows carry their own weight, so using the shared
+            # column here would divide by both periods' weights and halve the
+            # level - a wrong number that looks like a real one.
+            wkey = f"weight_{slot}"
+            w = frame[wkey] if wkey in frame.columns else (
+                frame["weight"] if "weight" in frame.columns else None)
+            if w is None:
+                return None
+            den = w.sum()
+            return _f((frame[slot] * w).sum() / den) if den else None
+
+        tot["before_prior"] = _rate_total(a, "prior")
+        tot["before_current"] = _rate_total(a, "current")
+        tot["after_prior"] = _rate_total(b, "prior")
+        tot["after_current"] = _rate_total(b, "current")
 
     if cfg.growth_applicable:
         tot["before_growth_pct"] = _safe_growth(tot["before_current"], tot["before_prior"])

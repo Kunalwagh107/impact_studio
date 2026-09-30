@@ -606,15 +606,19 @@ class RunRequest(BaseModel):
 
 def _resolve_mat_slots(a_prior: str, a_current: str, b_prior: str,
                        b_current: str, df_a: pd.DataFrame, df_b: pd.DataFrame,
-                       metric_label: str = "") -> tuple[str, str, str, str]:
+                       metric_label: str = "", period_col_a: str = "",
+                       period_col_b: str = "") -> tuple[str, str, str, str]:
     """Resolve a metric block's two period slots. Delegates to the engine.
 
     The rule lives in ``A.resolve_mat_slots`` and nothing here re-implements it:
     the analysis, this pre-flight validation and the QC must agree on which
     column each period is, and two copies of the rule is how they stop agreeing.
+    The period columns are passed through so a fact table that carries its
+    periods as *rows* resolves here exactly as it will in the analysis.
     """
     return A.resolve_mat_slots(a_prior, a_current, b_prior, b_current,
-                               df_a, df_b, metric_label)
+                               df_a, df_b, metric_label,
+                               period_col_a, period_col_b)
 
 
 def _validate_metric_wiring(req: RunRequest, df_a: pd.DataFrame,
@@ -627,6 +631,14 @@ def _validate_metric_wiring(req: RunRequest, df_a: pd.DataFrame,
     The period columns are resolved from the family before being checked, so the
     validation tests the columns the run will actually read rather than the ones
     the client happened to send.
+
+    **One period is enough to run.** A workbook that carries its periods as rows
+    may legitimately have no year-ago column and no MAT YA rows - the metric
+    then has one period, not a broken wiring. Refusing on the strength of a
+    column the data was never going to have is how a file with no ``Sales Value
+    YA`` came back as an error. Only a side that resolves **neither** period is
+    refused, because that is the case where the metric is not in the frame at
+    all and the analysis would genuinely be empty.
     """
     problems: list[str] = []
 
@@ -634,19 +646,23 @@ def _validate_metric_wiring(req: RunRequest, df_a: pd.DataFrame,
                     b_prior: str, b_current: str, weight_a: str,
                     weight_b: str, is_rate: bool) -> None:
         a_prior, a_current, b_prior, b_current = _resolve_mat_slots(
-            a_prior, a_current, b_prior, b_current, df_a, df_b, label)
+            a_prior, a_current, b_prior, b_current, df_a, df_b, label,
+            req.period_col_a, req.period_col_b)
         for side, df, ya, ty in (
             (f"{label}: A (previous)", df_a, a_prior, a_current),
             (f"{label}: B (updated)", df_b, b_prior, b_current),
         ):
+            if not (ya or ty):
+                problems.append(
+                    f"Dataset {side}: neither MAT YA nor MAT TY could be "
+                    f"resolved. The metric needs a column in this dataset - a "
+                    f"name ending YA for the year ago, the unqualified name or "
+                    f"one ending TY for the current period - or a Periods column "
+                    f"carrying MAT YA / MAT TY rows. Available numeric columns: "
+                    f"{', '.join(sorted(df.select_dtypes('number').columns)[:12])}")
+                continue
             for role, col in (("MAT YA (year ago)", ya), ("MAT TY (this year)", ty)):
-                if not col:
-                    problems.append(
-                        f"Dataset {side}: no {role} column could be resolved. "
-                        f"The metric family needs a year-ago column (a name "
-                        f"ending YA) and a current one (the unqualified name or "
-                        f"one ending TY).")
-                elif col not in df.columns:
+                if col and col not in df.columns:
                     problems.append(
                         f"Dataset {side}: column '{col}' for {role} does not exist "
                         f"in this dataset. Available numeric columns: "
@@ -668,7 +684,14 @@ def _validate_metric_wiring(req: RunRequest, df_a: pd.DataFrame,
                         m.a_prior, m.a_current, m.b_prior, m.b_current,
                         m.weight_metric_a, m.weight_metric_b, m.is_rate)
     else:
-        check_block("Metric", req.a_prior, req.a_current, req.b_prior,
+        # The label matters: `resolve_mat_slots` falls back to the *named*
+        # metric when the client sent no wiring, so passing the literal "Metric"
+        # here made this check resolve nothing while `_build_prepared_for` -
+        # which uses `req.metric_label` - resolved both periods. The two then
+        # disagreed and a blank wiring was refused as "neither period could be
+        # resolved" on a workbook that answers it from the family.
+        check_block(req.metric_label or "Metric",
+                    req.a_prior, req.a_current, req.b_prior,
                     req.b_current, req.weight_metric_a, req.weight_metric_b,
                     req.is_rate)
     return problems
@@ -781,7 +804,8 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
     # validation, the analysis and the QC on the same pair. `prepare` resolves
     # them again against the same frames and will agree.
     a_prior, a_current, b_prior, b_current = _resolve_mat_slots(
-        a_prior, a_current, b_prior, b_current, df_a, df_b, metric_label)
+        a_prior, a_current, b_prior, b_current, df_a, df_b, metric_label,
+        req.period_col_a, req.period_col_b)
 
     cfg = A.AnalysisConfig(
         metric_label=metric_label,
@@ -1160,6 +1184,10 @@ def export(req: ExportRequest):
         "baseline_verified": bool(prep.baseline_verified),
         "baseline_before": prep.baseline_total[0],
         "baseline_after": prep.baseline_total[1],
+        # What the run did to the data, carried into the deliverables' QC sheet
+        # and the run index. A report that covers a subset of the rows should say
+        # so itself - the reader of the workbook does not see the app.
+        "run_notes": [n for n in (prep.notes or []) if n],
     }
 
     for rep in reports:
@@ -1286,10 +1314,22 @@ def _write_index(path: str, reports: list[dict], qc: dict, run_name: str,
     ws2.write(0, 0, f"Automated QC - {qc.get('worst')}", ft)
     for i, h in enumerate(["Check", "Status", "Message"]):
         ws2.write(2, i, h, fh)
-    for r, c in enumerate(qc.get("checks", []), start=3):
+    checks = qc.get("checks", [])
+    for r, c in enumerate(checks, start=3):
         ws2.write(r, 0, c["name"], fl)
         ws2.write(r, 1, c["status"], fl)
         ws2.write(r, 2, c["message"], fl)
+    # What the run did to the data, below the checks and not counted among them -
+    # chiefly how much of it is in scope. The deliverable should say so itself,
+    # rather than only the app that produced it.
+    notes = [n for n in (meta.get("run_notes") or []) if n]
+    if notes:
+        r = 3 + len(checks) + 1
+        ws2.write(r, 0, "Run notes", fh)
+        for n in notes:
+            r += 1
+            ws2.write(r, 1, "•", fl)
+            ws2.write(r, 2, n, fl)
     wb.close()
 
 

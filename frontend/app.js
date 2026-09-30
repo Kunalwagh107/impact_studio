@@ -1482,15 +1482,16 @@ function renderMetricWiring(famsA, famsB) {
  * The two periods the study reads, shown per metric.
  *
  * This is a **report, not a question**. MAT YA and MAT TY are already in the
- * data: the metric family carries them as a period qualifier on the column name
- * (`Sales Value YA` is MAT YA; the unqualified `Sales Value` is MAT TY), and the
- * fact table's own `Periods` column says the same thing. Asking the user to name
- * them again invited a second answer that could disagree with the first, and the
- * default it offered (2YA -> YA) landed on a column one window too far back - so
- * A read B's year-ago column and the report called the difference growth.
+ * data, in one of two shapes: the metric family carries them as a period
+ * qualifier on the column name (`Sales Value YA` is MAT YA; the unqualified
+ * `Sales Value` is MAT TY), or the fact table's own `Periods` column carries
+ * them as rows over a single metric column. Asking the user to name them again
+ * invited a second answer that could disagree with the first, and the default it
+ * offered (2YA -> YA) landed on a column one window too far back - so A read B's
+ * year-ago column and the report called the difference growth.
  *
- * The server resolves both slots from the family and rewrites the wiring, so
- * there is nothing to choose here. What is shown is what the run will read.
+ * The rows come from `buildMetricBlocks`, so this shows exactly what the request
+ * will carry and the server will read - the two cannot disagree.
  */
 function renderMetricPeriods() {
   const box = $('#c-periods');
@@ -1500,34 +1501,37 @@ function renderMetricPeriods() {
     box.innerHTML = '<p class="hint">Select at least one metric.</p>';
     return;
   }
-  // The two slots the study reads, and the family variant that names each. The
-  // variant key is what the request carries; the column is what the user sees,
-  // because the column is the thing they can check against their workbook.
-  const SLOTS = [
-    { role: 'MAT YA', want: 'prior', variants: ['YA'], label: 'Year ago' },
-    { role: 'MAT TY', want: 'current', variants: ['VALUE', 'TY'], label: 'This year' },
-  ];
+  const byKey = {};
+  buildMetricBlocks().forEach(b => { byKey[b.key] = b; });
+  const slotsA = periodSlots('a'), slotsB = periodSlots('b');
+  const rowBased = (slotsA.ya && slotsA.ty) || (slotsB.ya && slotsB.ty);
+  const pcol = slotsA.col || slotsB.col || 'Periods';
   box.innerHTML = sel.map(def => {
-    const wires = resolveWiring(def);
-    const fa = S.profile.a.metric_families?.[wires.family_a] || {};
-    const fb = S.profile.b.metric_families?.[wires.family_b] || {};
+    const b = byKey[def.key] || {};
+    const SLOTS = [
+      { role: 'MAT YA', label: 'Year ago', a: b.a_prior, bb: b.b_prior },
+      { role: 'MAT TY', label: 'This year', a: b.a_current, bb: b.b_current },
+    ];
     const rows = SLOTS.map(slot => {
-      const colA = slot.variants.map(v => fa[v]).find(Boolean) || '';
-      const colB = slot.variants.map(v => fb[v]).find(Boolean) || colA;
       const cell = c => c
         ? `<code>${esc(c)}</code>`
         : '<span class="tag warn">not in this workbook</span>';
       return `<tr>
         <td><b>${esc(slot.role)}</b><div class="hint">${esc(slot.label)}</div></td>
-        <td>${cell(colA)}</td><td>${cell(colB)}</td>
+        <td>${cell(slot.a)}</td><td>${cell(slot.bb)}</td>
       </tr>`;
     }).join('');
+    const note = rowBased
+      ? `Read from the <code>${esc(pcol)}</code> column: both periods are the same
+         metric column, restricted to its <b>MAT YA</b> and <b>MAT TY</b> rows, so
+         there is nothing to map here.`
+      : `Read from the metric header — the period qualifier names each column, so
+         there is nothing to map here.`;
     return `<div class="wire-card">
       <div class="wire-head">${esc(def.label)}
         ${def.is_rate ? '<span class="tag warn">no growth</span>' : ''}</div>
-      <p class="hint" style="margin:2px 0 8px">Read from the Period columns — the
-         qualifier in the metric header names each period, so there is nothing to
-         map here. <b>2YA</b> is not part of the study and is never read.</p>
+      <p class="hint" style="margin:2px 0 8px">${note}
+         <b>2YA</b> is not part of the study and is never read.</p>
       <table class="mini" style="width:100%"><thead><tr>
         <th style="width:34%">Period</th>
         <th>${esc(S.profile.a.label || 'Previous dataset')}</th>
@@ -1580,6 +1584,29 @@ function resolveWiring(def) {
 }
 
 /**
+ * The period values the fact table's own Periods column carries, per side.
+ *
+ * A workbook that stores its periods as *rows* has one metric column and a
+ * `Periods` column saying which period each row is. The profile records the
+ * distinct values it saw, which is what tells the two conventions apart: a
+ * `Periods` column carrying only MAT TY is the column-name convention (the
+ * periods are the `Sales Value YA` / `Sales Value` columns), while one carrying
+ * both MAT YA and MAT TY is the row convention.
+ */
+function periodSlots(side) {
+  const pcol = ((S.dimCols || {})[side] || {}).period || '';
+  const prof = S.profile?.[side] || {};
+  const cp = (prof.column_profiles || []).find(c => c && c.name === pcol);
+  const norm = v => String(v || '').toUpperCase().replace(/[^A-Z0-9]+/g, ' ').trim();
+  const vals = (cp && Array.isArray(cp.samples) ? cp.samples : []).map(norm);
+  return {
+    col: pcol,
+    ya: vals.some(v => v === 'MAT YA' || v === 'YA'),
+    ty: vals.some(v => v === 'MAT TY' || v === 'TY'),
+  };
+}
+
+/**
  * Turn the selected metrics into the request blocks, reading the periods from
  * the family and the per-side weight columns.
  *
@@ -1587,9 +1614,16 @@ function resolveWiring(def) {
  * named by a variant of the metric family the profile found. There is no longer
  * a select to read: the request derives the two columns itself, so the only
  * possible answer is the one the period qualifier gives.
+ *
+ * This mirrors the server's rule (`analysis.resolve_mat_slots`) deliberately.
+ * Where the two conventions differ the request must not disagree with the run:
+ * on a workbook whose periods are *rows*, a family with a single column
+ * supplies **both** slots from that one column, and the `Periods` column - not
+ * the column name - separates them.
  */
 function buildMetricBlocks() {
   const out = [];
+  const slotsA = periodSlots('a'), slotsB = periodSlots('b');
   METRIC_DEFS.forEach(def => {
     if (!S.metricSel?.[def.key]) return;
     const w = resolveWiring(def);
@@ -1603,25 +1637,37 @@ function buildMetricBlocks() {
     // `2YA` is excluded by construction - it is a third moving-annual window
     // the study does not use, and including it here is what previously made the
     // "year ago" slot read a column two years back.
-    const matSlot = (fam, want) => {
+    //
+    // The positional fallback is only trustworthy when the family really carries
+    // two columns. One column is **one period**, and whether the Periods column
+    // supplies the other is what decides it - so a workbook with no year-ago
+    // column and no MAT YA rows reports no year ago rather than reading the same
+    // column twice.
+    const matSlot = (fam, want, slots) => {
       const keys = Object.keys(fam || {});
       if (!keys.length) return { key: '', col: '' };
-      const preferred = want === 'ya' ? ['YA'] : ['VALUE', 'TY'];
-      let key = preferred.find(v => keys.includes(v));
-      if (!key) {
-        // No recognised qualifier: order the variants and take an end, with the
-        // later one as MAT TY. 2YA never participates.
+      let pk = keys.includes('YA') ? 'YA' : '';
+      let ck = ['VALUE', 'TY'].find(v => keys.includes(v)) || '';
+      if (!pk || !ck) {
         const ordered = keys.filter(k => k !== '2YA').sort(
           (x, y) => (VARIANT_ORDER.indexOf(x) + 1 || 99) - (VARIANT_ORDER.indexOf(y) + 1 || 99));
-        key = want === 'ya' ? (ordered[0] || '') : (ordered[ordered.length - 1] || '');
+        if (ordered.length >= 2) {
+          pk = pk || ordered[ordered.length - 2];
+          ck = ck || ordered[ordered.length - 1];
+        } else if (ordered.length === 1) {
+          ck = ck || ordered[0];
+        }
       }
+      let key = want === 'ya' ? pk : ck;
+      const carried = want === 'ya' ? slots.ya : slots.ty;
+      if (!key && carried) key = ck || keys.find(k => k !== '2YA') || '';
       return { key, col: (key && fam[key]) || '' };
     };
 
     // A and B name their periods independently; B falls back to A's column only
     // when its own family cannot supply the slot at all.
-    const yaA = matSlot(fa, 'ya'), tyA = matSlot(fa, 'ty');
-    const yaB = matSlot(fb, 'ya'), tyB = matSlot(fb, 'ty');
+    const yaA = matSlot(fa, 'ya', slotsA), tyA = matSlot(fa, 'ty', slotsA);
+    const yaB = matSlot(fb, 'ya', slotsB), tyB = matSlot(fb, 'ty', slotsB);
     out.push({
       key: def.key,
       label: def.label,
@@ -1659,9 +1705,17 @@ function defaultWeight(side) {
  * The metric wiring must resolve on both sides. Previously an unmapped side
  * silently produced an empty analysis, which reads as "the selection does not
  * work" - so say so up front and block the run.
+ *
+ * **One period is enough to run.** A workbook that carries its periods as rows
+ * may legitimately have no year-ago column and no MAT YA rows; the metric then
+ * has one period, not a broken wiring, and the run reports the period it has.
+ * Blocking on a column the data was never going to have is how a file with no
+ * `Sales Value YA` came back as an error. Only a side that resolves *neither*
+ * period is refused - that is the case where the analysis would be empty.
  */
 function validateMetricWiring() {
   const problems = [];
+  const warnings = [];
   const blocks = buildMetricBlocks();
   if (!blocks.length) problems.push('Select at least one metric.');
   // Every column the profile knows about, per side. Checking the resolves against
@@ -1685,16 +1739,24 @@ function validateMetricWiring() {
   };
   const colsA = knownCols('a'), colsB = knownCols('b');
   blocks.forEach(b => {
-    [['MAT YA (year ago)', b.a_prior, colsA],
-     ['MAT TY (this year)', b.a_current, colsA],
-     ['MAT YA (year ago)', b.b_prior, colsB],
-     ['MAT TY (this year)', b.b_current, colsB]]
-      .forEach(([label, v, known]) => {
-        if (!v) problems.push(`${b.label}: no ${label} column resolved`);
+    [['A (previous)', b.a_prior, b.a_current, colsA],
+     ['B (updated)', b.b_prior, b.b_current, colsB]]
+      .forEach(([side, ya, ty, known]) => {
+        const have = [ya, ty].filter(Boolean);
+        if (!have.length) {
+          problems.push(`${b.label} · ${side}: neither MAT YA nor MAT TY could be resolved`);
+          return;
+        }
         // Only enforce membership when the profile actually listed columns; an
         // empty set means we do not know, and guessing would be worse.
-        else if (known.size && !known.has(v)) {
-          problems.push(`${b.label}: ${label} column "${v}" is not in this dataset`);
+        const stray = have.find(v => known.size && !known.has(v));
+        if (stray) {
+          problems.push(`${b.label} · ${side}: column "${stray}" is not in this dataset`);
+          return;
+        }
+        if (!ya || !ty) {
+          warnings.push(`${b.label} · ${side}: no ${!ya ? 'MAT YA' : 'MAT TY'} in this `
+            + 'workbook — that period is reported as unavailable rather than computed');
         }
       });
     if (b.is_rate && !b.weight_metric_a && !b.weight_metric_b) {
@@ -1707,6 +1769,9 @@ function validateMetricWiring() {
     if (problems.length) {
       el.innerHTML = `<div class="notice err"><b>The analysis cannot run yet.</b><br>· `
         + problems.map(esc).join('<br>· ') + '</div>';
+    } else if (warnings.length) {
+      el.innerHTML = `<div class="notice warn"><b>Runnable, with one period.</b><br>· `
+        + warnings.map(esc).join('<br>· ') + '</div>';
     } else {
       el.innerHTML = `<div class="notice ok">Wired: `
         + blocks.map(b => `<b>${esc(b.label)}</b>`
@@ -1815,6 +1880,13 @@ function runRequest() {
     a, b,
     dim_col_a: S.dimCols.a,
     dim_col_b: S.dimCols.b,
+    // The period dimension, so the server can read the study's two periods from
+    // the fact table's own Periods column when the workbook stores them as rows.
+    // It also keys the QC's duplicate check on the real grain. The server still
+    // resolves the column from the data when this is blank, so nothing depends
+    // on the profile having guessed it.
+    period_col_a: (S.dimCols.a || {}).period || '',
+    period_col_b: (S.dimCols.b || {}).period || '',
     // Single-metric fields kept in sync for the legacy path; the multi-metric
     // list is what the server uses when it is non-empty.
     metric_label: metrics.map(m => m.label).join(' + '),
@@ -1887,17 +1959,15 @@ function renderRun() {
 
   // `notes` carries anything that would otherwise be a silently wrong number -
   // chiefly a degenerate period wiring, where prior and current resolve to the
-  // same column and every growth rate reads 0%. The server has always sent it;
-  // it was never rendered, so a warning nobody sees was doing no work.
+  // same column and every growth rate reads 0%. It is **not** a QC result and it
+  // is not shown above the analysis: a titled warning box over the KPIs reads as
+  // "this run is suspect" even when every check passed, which is exactly the
+  // wrong signal. The notes live in the QC tab instead, where a reader goes to
+  // find out what the run did. See `renderQC`.
   const notes = (d.notes || []).filter(Boolean);
-  const notesBanner = notes.length
-    ? `<div class="notice warn"><b>Check the period wiring</b><ul style="margin:6px 0 0 18px">${
-        notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></div>`
-    : '';
 
   $('#run-out').innerHTML = `
     ${qcBanner}
-    ${notesBanner}
     <div class="kpis">
       <div class="kpi neutral"><div class="k-label">Categories analysed</div>
         <div class="k-value">${cats.length}</div>
@@ -1923,7 +1993,7 @@ function renderRun() {
     <div id="run-body"></div>`;
 
   const showCat = i => renderCategory(cats[i], scale, unit);
-  const showQC = () => renderQC(qc);
+  const showQC = () => renderQC(qc, notes);
   $$('#run-tabs .tab').forEach(t => t.onclick = () => {
     $$('#run-tabs .tab').forEach(x => x.classList.remove('active'));
     t.classList.add('active');
@@ -2112,58 +2182,60 @@ function renderEntities(m, { scale, unit, g }) {
   const mt = m.manufacturer_top_n || [];
   const bt = m.brand_top_n || [];
   const rep = m;
-  return `
-    ${mt.length ? `
-    <div class="blk">
-      <div class="blk-head"><h4>Manufacturer Top-${mt.length}</h4>
-        <span class="sub">the ${mt.length} largest manufacturers in the previous database, followed into the updated one</span></div>
+  // The ranked tables read exactly like the Market block: the MAT YA / MAT TY
+  // levels of BEFORE and AFTER first, then the share change, then the ranks.
+  // Rank-first buried the levels behind a position, and the movement is what the
+  // deck is for - a rank is the consequence of it, not the headline. Growth is
+  // deliberately absent: for a ranked entity the share change is the comparable
+  // movement, and a growth column here was the odd one out.
+  const ranked = (rows, first) => `
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>Manufacturer</th><th>Rank BEFORE</th><th>Rank AFTER</th>
-            <th>Δ Rank</th><th>BEFORE MAT TY</th><th>AFTER MAT TY</th>
-            ${g ? '<th>AFTER growth</th>' : '<th>Abs change</th>'}<th>Share chg</th><th>Movement</th></tr></thead>
+          <thead><tr>
+            <th rowspan="2">${esc(first)}</th>
+            <th colspan="2" class="grp-before">BEFORE</th>
+            <th colspan="2" class="grp-after">AFTER</th>
+            <th rowspan="2">Share change</th>
+            <th colspan="2">Rank</th>
+            <th rowspan="2">Δ Rank</th>
+            <th rowspan="2">Movement</th>
+          </tr>
+          <tr>
+            <th>MAT YA</th><th>MAT TY</th>
+            <th>MAT YA</th><th>MAT TY</th>
+            <th>BEFORE</th><th>AFTER</th>
+          </tr></thead>
           <tbody>
-            ${mt.map(b => `<tr class="${b.movement === 'NEW' || b.movement === 'EXITED' ? 'hi' : ''}">
+            ${rows.map(b => `<tr class="${b.movement === 'NEW' || b.movement === 'EXITED' ? 'hi' : ''}">
               <td>${esc(b.name)}</td>
+              <td class="num">${fmtVal(b.before_prior, scale, unit)}</td>
+              <td class="num">${fmtVal(b.before_current, scale, unit)}</td>
+              <td class="num">${fmtVal(b.after_prior, scale, unit)}</td>
+              <td class="num">${fmtVal(b.after_current, scale, unit)}</td>
+              <td class="num ${cls(b.share_change_pp)}">${pp(b.share_change_pp)}</td>
               <td class="num">${b.rank_before ?? '–'}</td>
               <td class="num">${b.rank_after ?? '–'}</td>
               <td class="num ${b.rank_change > 0 ? 'pos' : b.rank_change < 0 ? 'neg' : 'zero'}">${b.rank_change !== null && b.rank_change !== undefined ? (b.rank_change > 0 ? '+' : '') + b.rank_change : '–'}</td>
-              <td class="num">${fmtVal(b.before_current, scale, unit)}</td>
-              <td class="num">${fmtVal(b.after_current, scale, unit)}</td>
-              ${g ? `<td class="num ${cls(b.after_growth_pct)}">${pct(b.after_growth_pct)}</td>` :
-                `<td class="num ${cls((b.after_current || 0) - (b.before_current || 0))}">${fmtVal((b.after_current || 0) - (b.before_current || 0), scale, unit)}</td>`}
-              <td class="num ${cls(b.share_change_pp)}">${pp(b.share_change_pp)}</td>
               <td style="text-align:left"><b>${esc(b.movement || '')}</b></td>
             </tr>`).join('')}
           </tbody>
         </table>
-      </div>
+      </div>`;
+  return `
+    ${mt.length ? `
+    <div class="blk">
+      <div class="blk-head"><h4>Manufacturer Top-${mt.length}</h4>
+        <span class="sub">the ${mt.length} largest manufacturers in the previous database, followed into the updated one
+          — MAT YA / MAT TY, then share change, then rank</span></div>
+      ${ranked(mt, 'Manufacturer')}
     </div>` : ''}
 
     ${bt.length ? `
     <div class="blk">
       <div class="blk-head"><h4>Brand Top-${bt.length}</h4>
-        <span class="sub">the ${bt.length} largest brands in the previous database, followed into the updated one</span></div>
-      <div class="tbl-wrap">
-        <table>
-          <thead><tr><th>Brand</th><th>Rank BEFORE</th><th>Rank AFTER</th>
-            <th>Δ Rank</th><th>BEFORE MAT TY</th><th>AFTER MAT TY</th>
-            ${g ? '<th>AFTER growth</th>' : '<th>Abs change</th>'}<th>Movement</th></tr></thead>
-          <tbody>
-            ${bt.map(b => `<tr class="${b.movement === 'NEW' || b.movement === 'EXITED' ? 'hi' : ''}">
-              <td>${esc(b.name)}</td>
-              <td class="num">${b.rank_before ?? '–'}</td>
-              <td class="num">${b.rank_after ?? '–'}</td>
-              <td class="num ${b.rank_change > 0 ? 'pos' : b.rank_change < 0 ? 'neg' : 'zero'}">${b.rank_change !== null && b.rank_change !== undefined ? (b.rank_change > 0 ? '+' : '') + b.rank_change : '–'}</td>
-              <td class="num">${fmtVal(b.before_current, scale, unit)}</td>
-              <td class="num">${fmtVal(b.after_current, scale, unit)}</td>
-              ${g ? `<td class="num ${cls(b.after_growth_pct)}">${pct(b.after_growth_pct)}</td>` :
-                `<td class="num ${cls((b.after_current || 0) - (b.before_current || 0))}">${fmtVal((b.after_current || 0) - (b.before_current || 0), scale, unit)}</td>`}
-              <td style="text-align:left"><b>${esc(b.movement || '')}</b></td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </div>
+        <span class="sub">the ${bt.length} largest brands in the previous database, followed into the updated one
+          — MAT YA / MAT TY, then share change, then rank</span></div>
+      ${ranked(bt, 'Brand')}
     </div>` : ''}
 
     ${(rep.client_brands?.length || rep.client_manufacturers?.length) ? `
@@ -2172,20 +2244,25 @@ function renderEntities(m, { scale, unit, g }) {
         <span class="sub">reported independently of the Top-N cut</span></div>
       <div class="tbl-wrap">
         <table>
-          <thead><tr><th>Entity</th><th>Level</th><th>BEFORE MAT TY</th><th>AFTER MAT TY</th>
-            <th>Rank BEFORE</th><th>Rank AFTER</th><th>Share chg</th><th>In Top-N</th><th>Movement</th></tr></thead>
+          <thead><tr><th>Entity</th><th>Level</th>
+            <th>BEFORE MAT YA</th><th>BEFORE MAT TY</th>
+            <th>AFTER MAT YA</th><th>AFTER MAT TY</th>
+            <th>Share chg</th><th>Rank BEFORE</th><th>Rank AFTER</th>
+            <th>In Top-N</th><th>Movement</th></tr></thead>
           <tbody>
             ${[...(rep.client_brands || []).map(b => ['brand', b]),
                ...(rep.client_manufacturers || []).map(b => ['manufacturer', b])]
               .map(([lvl, b]) => b.found === false
                 ? `<tr><td>${esc(b.name)}</td><td style="text-align:left">${lvl}</td>
-                     <td colspan="7" style="text-align:left;color:var(--muted)">not present in either dataset</td></tr>`
+                     <td colspan="9" style="text-align:left;color:var(--muted)">not present in either dataset</td></tr>`
                 : `<tr><td>${esc(b.name)}</td><td style="text-align:left">${lvl}</td>
+                     <td class="num">${fmtVal(b.before_prior, scale, unit)}</td>
                      <td class="num">${fmtVal(b.before_current, scale, unit)}</td>
+                     <td class="num">${fmtVal(b.after_prior, scale, unit)}</td>
                      <td class="num">${fmtVal(b.after_current, scale, unit)}</td>
+                     <td class="num ${cls(b.share_change_pp)}">${pp(b.share_change_pp)}</td>
                      <td class="num">${b.rank_before ?? '–'}</td>
                      <td class="num">${b.rank_after ?? '–'}</td>
-                     <td class="num ${cls(b.share_change_pp)}">${pp(b.share_change_pp)}</td>
                      <td style="text-align:left">${b.in_top_n ? 'Yes' : 'No'}</td>
                      <td style="text-align:left"><b>${esc(b.movement || '')}</b></td></tr>`).join('')}
           </tbody>
@@ -2220,13 +2297,34 @@ function renderEntities(m, { scale, unit, g }) {
   `;
 }
 
-function renderQC(qc) {
+/**
+ * The QC tab: what was verified, then what the run recorded about the data.
+ *
+ * Two different things, kept apart on purpose. The **checks** can pass, warn or
+ * fail - they are verifications, and the counts above the analysis come from
+ * them alone. The **run notes** cannot fail: they say what the run did to the
+ * data (rows outside the mapped categories, a period column corrected, a slot
+ * the workbook cannot supply), which is a record rather than a result. Counting
+ * them as warnings would make a run that verified everything report "2 warnings",
+ * and putting them above the KPIs read as "this analysis is suspect" - both are
+ * worse than saying plainly what happened, here, where the reader looks.
+ */
+function renderQC(qc, notes) {
+  const noteList = (notes || []).filter(Boolean);
+  const notesBlock = noteList.length ? `
+    <div class="notice warn" data-qc-notes>
+      <b>Run notes</b>
+      <div class="hint" style="margin:3px 0 0">What this run did to the data, recorded so
+        nothing changes silently. These are not checks — none of them failed.</div>
+      <ul style="margin:8px 0 0 18px">${noteList.map(n => `<li>${esc(n)}</li>`).join('')}</ul>
+    </div>` : '';
   $('#run-body').innerHTML = `
     <div class="notice ${qc.worst === 'PASS' ? 'ok' : qc.worst === 'WARN' ? 'warn' : 'err'}">
       Overall QC status: <b>${qc.worst}</b> — ${qc.counts.PASS} passed,
       ${qc.counts.WARN} warning(s), ${qc.counts.FAIL} failure(s).
       Checks that could not be verified are reported as warnings rather than silently passed.
     </div>
+    ${notesBlock}
     <div class="qc-list">
       ${qc.checks.map(c => `
         <div class="qc-row ${c.status}">

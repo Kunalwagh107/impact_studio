@@ -77,29 +77,53 @@ def check_metric_wiring(cfg, df_a, df_b, qc: QCReport) -> None:
     they have already been resolved from the Metric Period columns by the time
     this runs - so a PASS here means the analysis read the columns the period
     qualifiers name, not merely that the client sent something.
+
+    **A period the data does not have is a WARN, not a FAIL.** On a workbook
+    that carries its periods as rows, a metric with no year-ago column and no
+    MAT YA rows has one period, not a broken wiring - and reporting that as a
+    failure on correct data is how a QC panel teaches people to ignore it. A
+    side that resolves *no* period is still a FAIL, because that is a metric
+    that is not in the frame at all.
     """
-    problems = []
+    problems: list[str] = []
+    missing: list[str] = []
     for label, df, col in (
         ("A MAT YA", df_a, cfg.a_prior), ("A MAT TY", df_a, cfg.a_current),
         ("B MAT YA", df_b, cfg.b_prior), ("B MAT TY", df_b, cfg.b_current),
     ):
         if not col:
-            problems.append(f"{label}: no column resolved from the period columns")
+            missing.append(label)
         elif col not in df.columns:
             problems.append(f"{label}: '{col}' missing from dataset")
         elif not pd.api.types.is_numeric_dtype(df[col]):
             problems.append(f"{label}: '{col}' is not numeric")
+    # A side with no period at all cannot produce a figure.
+    for side, ya, ty in (("A", cfg.a_prior, cfg.a_current),
+                         ("B", cfg.b_prior, cfg.b_current)):
+        if not ya and not ty:
+            problems.append(f"{side}: neither MAT YA nor MAT TY resolved")
+    period_note = (f" · periods read from the '{cfg.period_col}' column"
+                   if cfg.period_col else "")
+    payload = {"metric": cfg.metric_label,
+               "mat_ya": {"a": cfg.a_prior, "b": cfg.b_prior},
+               "mat_ty": {"a": cfg.a_current, "b": cfg.b_current},
+               "period_col": cfg.period_col or "",
+               "period_col_b": cfg.period_col_b or ""}
     if problems:
         qc.add("metric_wiring", "Metric column wiring", FAIL,
-               "; ".join(problems), {"problems": problems})
+               "; ".join(problems), {"problems": problems, **payload})
+    elif missing:
+        qc.add("metric_wiring", "Metric column wiring", WARN,
+               f"{', '.join(missing)} not present in this workbook, so that "
+               f"period is reported as unavailable rather than computed. The "
+               f"other period resolves normally{period_note}.",
+               {"unavailable": missing, **payload})
     else:
         qc.add("metric_wiring", "Metric column wiring", PASS,
                f"Both periods resolve on each side from the Metric Period "
                f"columns: A['{cfg.a_prior}' (MAT YA) -> '{cfg.a_current}' (MAT TY)], "
-               f"B['{cfg.b_prior}' (MAT YA) -> '{cfg.b_current}' (MAT TY)]",
-               {"metric": cfg.metric_label,
-                "mat_ya": {"a": cfg.a_prior, "b": cfg.b_prior},
-                "mat_ty": {"a": cfg.a_current, "b": cfg.b_current}})
+               f"B['{cfg.b_prior}' (MAT YA) -> '{cfg.b_current}' (MAT TY)]"
+               f"{period_note}", payload)
 
 
 def check_missing_values(df_a, df_b, cfg, qc: QCReport) -> None:

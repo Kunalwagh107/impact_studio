@@ -451,7 +451,7 @@ def build_category_deck(report: dict, qc: dict, out_path: str,
                 b["name"][:30],
                 _fmt(b.get("before_prior"), scale, unit),
                 _fmt(b.get("before_current"), scale, unit),
-                _fmt(b.get("before_current"), scale, unit),
+                _fmt(b.get("after_prior"), scale, unit),
                 _fmt(b.get("after_current"), scale, unit),
                 _pp(b.get("share_change_pp")),
                 b["rank_before"] or "-",
@@ -459,10 +459,14 @@ def build_category_deck(report: dict, qc: dict, out_path: str,
                 (f"{b['rank_change']:+d}" if b.get("rank_change") is not None else "-"),
                 b.get("movement") or "",
             ])
-        _table(s, ["Manufacturer", "MAT YA", "MAT TY", "Before", "After",
+        # The MAT YA / MAT TY levels of BEFORE and AFTER lead, then the share
+        # change, then the ranks - the Market Regions layout. Growth is absent on
+        # purpose: for a ranked entity the share change is the comparable movement.
+        _table(s, ["Manufacturer", "BEFORE MAT YA", "BEFORE MAT TY",
+                   "AFTER MAT YA", "AFTER MAT TY",
                    "Share chg", "Rank BEFORE", "Rank AFTER", "Rank chg", "Movement"],
                rows, Inches(0.6), Inches(1.7), SW - Inches(1.2), Inches(4.9),
-               col_w=[24, 9, 9, 9, 9, 9, 9, 9, 8, 10], font=9,
+               col_w=[21, 10, 10, 10, 10, 9, 9, 9, 8, 10], font=9,
                highlight_rows={i for i, b in enumerate(mtop)
                                if b.get("movement") in ("NEW", "EXITED")})
 

@@ -959,16 +959,29 @@ async function main() {
     tabs: document.querySelectorAll('#run-tabs .tab').length,
     tables: document.querySelectorAll('#run-body table').length,
     banner: document.querySelector('#run-out .notice')?.innerText,
+    noticesAboveKpis: document.querySelectorAll('#run-out > .notice').length,
     body: (document.querySelector('#run-body') || {}).innerText || '',
   })`)
   console.log('  run:', JSON.stringify({ kpis: run.kpis, tabs: run.tabs,
-    tables: run.tables }))
+    tables: run.tables, noticesAboveKpis: run.noticesAboveKpis }))
   const nSel = TARGETS.length
   check('KPI cards rendered', run.kpis >= 5, `${run.kpis}`)
   check('a tab per category plus QC', run.tabs === nSel + 1,
         `${run.tabs} (expected ${nSel + 1})`)
   check('analysis tables rendered', run.tables >= 3, `${run.tables}`)
   check('QC banner rendered', /QC/.test(run.banner || ''), (run.banner || '').slice(0, 70))
+  // Exactly one box above the KPIs - the QC status line. The run *notes* used to
+  // render here too, under a "Check the period wiring" heading, which read as
+  // "this analysis is suspect" even when every check passed. They belong in the
+  // QC tab (asserted below), not over the numbers.
+  check('no warning box sits above the KPIs, only the QC status line',
+        run.noticesAboveKpis === 1, `${run.noticesAboveKpis} notice(s) above the KPIs`)
+  // Scroll to the top before the screenshot. `Page.captureScreenshot` captures
+  // the *viewport*, and the walk has scrolled a long way down by now - so this
+  // shot used to document the Top-N tables and never the headline the step is
+  // named for. The user's report was about exactly that part of the screen.
+  await evaluate(`(() => { window.scrollTo(0, 0); return true })()`)
+  await sleep(300)
   await shot('08-step6-analysis')
 
   // the channel block must actually carry BEFORE/AFTER headers
@@ -990,10 +1003,25 @@ async function main() {
     rows: document.querySelectorAll('#run-body .qc-row').length,
     passes: document.querySelectorAll('#run-body .qc-row.PASS').length,
     fails: document.querySelectorAll('#run-body .qc-row.FAIL').length,
+    runNotes: document.querySelectorAll('#run-body [data-qc-notes]').length,
+    runNotesText: (document.querySelector('#run-body [data-qc-notes]') || {}).innerText || '',
+    runNotesHtml: ((document.querySelector('#run-body [data-qc-notes]') || {}).innerHTML || '')
+      .slice(0, 400),
   })`)
-  console.log('  qc:', JSON.stringify(qc))
+  console.log('  qc:', JSON.stringify({ ...qc, runNotesHtml: undefined }))
+  console.log('  run-notes text:', JSON.stringify(qc.runNotesText))
+  console.log('  run-notes html:', JSON.stringify(qc.runNotesHtml))
   check('QC checks listed', qc.rows >= 10, `${qc.rows}`)
   check('QC shows no failures', qc.fails === 0, `${qc.fails} fail`)
+  // The walk maps 2 of 151 categories, so the run has notes to record (rows
+  // outside the mapped categories). They must be here - in the QC tab, as a
+  // recorded note - and not above the KPIs, which is where they used to sit.
+  check('the run notes are reported in the QC tab', qc.runNotes >= 1,
+        `${qc.runNotes} note block(s)`)
+  check('the run notes say what the run covered, not that rows were "dropped"',
+        /are in categories you mapped/.test(qc.runNotesText)
+        && !/row\(s\) dropped/.test(qc.runNotesText),
+        qc.runNotesText.slice(0, 110))
   await shot('09-step6-qc')
 
   // ---- text sanity sweep --------------------------------------------------

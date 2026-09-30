@@ -219,6 +219,57 @@ def classify_period_value(value: Any) -> str:
     return ""
 
 
+def period_slots_present(df: pd.DataFrame, period_col: str) -> set[str]:
+    """Which of the study's two periods a fact table's own ``Periods`` column carries.
+
+    The two workbooks conventions differ, and this is what tells them apart:
+
+    * **wide** - the periods are separate *columns* (``Sales Value YA``,
+      ``Sales Value``) and the ``Periods`` column labels the row's primary
+      period, so it carries ``MAT TY`` only;
+    * **long** - the periods are separate *rows*, one metric column, and the
+      ``Periods`` column carries both ``MAT YA`` and ``MAT TY``.
+
+    Anything the classifier does not recognise (a month name, a blank) is not a
+    slot and is left out, so a monthly trend column returns the empty set rather
+    than being mistaken for a period dimension.
+    """
+    if not period_col or period_col not in df.columns:
+        return set()
+    vals = {classify_period_value(v) for v in df[period_col].dropna().unique()}
+    return {v for v in vals if v}
+
+
+def detect_period_column(df: pd.DataFrame, prefer: str = "") -> str:
+    """The column that names MAT YA / MAT TY in a frame, wired name first.
+
+    Used as the fallback when the period dimension was not wired: the study's
+    periods come from the data, so a client that sent no period column must not
+    make the row-based convention unreachable. Only a column whose values
+    actually classify to a study period is eligible - a ``Month`` column of
+    month names returns nothing, which is the honest answer.
+    """
+    if prefer and prefer in df.columns and period_slots_present(df, prefer):
+        return prefer
+    best = ""
+    for col in df.columns:
+        s = df[col]
+        if pd.api.types.is_numeric_dtype(s) or pd.api.types.is_bool_dtype(s):
+            continue
+        if not period_slots_present(df, col):
+            continue
+        low = re.sub(r"[_\-]+", " ", str(col)).strip().lower()
+        # A column that calls itself a period wins over one that merely
+        # contains the values, so a stray flag column cannot take the role.
+        if re.search(r"\bperiod\w*", low):
+            return str(col)
+        if not best:
+            best = str(col)
+    if best:
+        return best
+    return prefer if prefer in df.columns else ""
+
+
 def default_period_columns(variants: Mapping[str, str] | None) -> tuple[str, str]:
     """The (MAT YA, MAT TY) *columns* a metric family resolves to.
 

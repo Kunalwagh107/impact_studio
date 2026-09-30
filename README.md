@@ -225,18 +225,40 @@ a family existed on only one side — or the datasets simply named the metric
 differently — one side's period selects went empty, the run sent blank column
 names, and the analysis came back empty. That read as "the metric selection
 doesn't work". The app now states the wiring status explicitly and the server
-**refuses to run** with an unmapped column, naming the offending columns:
+**refuses to run** when a side resolves *no* period at all, naming what it could
+not find:
 
 ```json
 {
   "error": "metric_wiring_incomplete",
   "message": "The metric and period selection is incomplete, so the analysis would come back empty.",
-  "problems": ["Dataset B (updated): no prior period column selected.", ...]
+  "problems": ["Dataset B (updated): neither MAT YA nor MAT TY could be resolved.", ...]
 }
 ```
 
 Rate metrics (distribution, share, price, index) are detected by name and
 averaged with a weight column, selectable per side.
+
+### The two periods are read from the data, not mapped again
+
+The study needs exactly two periods — **MAT YA** (year ago) and **MAT TY** (this
+year) — and both are already in the workbook, in one of two shapes:
+
+| | the periods are | what the study reads |
+|---|---|---|
+| **wide** | columns: `Sales Value YA` is MAT YA, the unqualified `Sales Value` is MAT TY | those two columns |
+| **long** | **rows**: one metric column, and a `Periods` column carrying `MAT YA` / `MAT TY` | the one column, restricted to each period's rows |
+
+Nothing asks for them twice, and **`2YA` is never a study period** — it is a
+third moving-annual window the study does not use, and treating it as "the year
+ago" is how an earlier build read a column two years back and reported the move
+as growth.
+
+A workbook that carries only one of the two periods still runs: the period it has
+is reported and the missing one is named as unavailable, rather than refusing the
+run on the strength of a column the file was never going to have. A rate metric's
+weight is restricted to the same rows as its period, so a row-based workbook does
+not halve its own distribution levels.
 
 ---
 
@@ -270,8 +292,16 @@ metrics at all.
 
 **Brand value share** — MAT YA, MAT TY and share change in pp, before and after.
 
-**Manufacturer / Brand Top-N** — rank before, rank after, rank change, values
-for both periods, and a movement class:
+**Manufacturer / Brand Top-N** — the same shape as the market block, so the two
+read alike:
+
+| Entity | BEFORE MAT YA | BEFORE MAT TY | AFTER MAT YA | AFTER MAT TY | Share change | Rank BEFORE | Rank AFTER | Rank change | Movement |
+|---|---|---|---|---|---|---|---|---|---|
+
+The levels lead and the rank follows — a rank is the *consequence* of the
+movement, not the headline — and there is no growth column, because for a ranked
+entity the share change is the comparable movement. The selection is the largest
+entities in the **previous** database, followed into the updated one. Movement:
 
 - `NEW` — present only in the updated dataset
 - `EXITED` — present only in the previous dataset
@@ -321,12 +351,21 @@ reports the cap — otherwise the leftover entities would look like genuine gaps
 
 ## Automated QC
 
-Eleven checks run before the export. Two rules are enforced:
+Twelve checks run before the export. Three rules are enforced:
 
 - **A check must be able to fail.** Each has a concrete threshold and emits the
   numbers it compared.
 - **A check that cannot run reports `WARN` ("Not verified"), never `PASS`.** A
   green tick that means "did not run" is worse than no tick.
+- **A check that cannot fail is not a check.** A run also records **notes** —
+  what it did to the data (how much of it is inside the mapped categories, a
+  period column corrected, a period the workbook cannot supply). They appear in
+  the QC panel under **Run notes** and in every workbook's QC sheet, and they
+  are deliberately **not counted** among the checks: a run that verified
+  everything should not report "2 warnings" merely because it also told you what
+  it covered. They are also not shown above the headline figures — a titled
+  warning box over the KPIs reads as "this analysis is suspect" even when every
+  check passed.
 
 | Check | What it proves |
 |---|---|

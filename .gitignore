@@ -42,6 +42,13 @@ tools/ui_probe/*.log
 # Chrome profile. ~92 MB after a single full run, all of it regenerable.
 tools/ui_probe/_run/
 tools/ui_probe/_run*/
+# Scratch a suite writes outside the probe directory (e.g. the synthetic long
+# workbook verify_period_rows.py builds).
+tools/_run/
+
+# The long-format fixture, derived from the reference workbook by
+# tools/make_long_fixture.py. 7.6 MB and regenerable, like the workbook itself.
+TW_Impact_Study_V3_LONG_MAT_YA_MAT_TY.xlsx
 
 # A stray nested tree produced by running a probe whose script `cd`s to its own
 # directory: `tools/ui_probe/tools/ui_probe/`. Not source.
@@ -89,3 +96,9 @@ TW Impact Study_V2 1 (1).xlsx
 .workbuddy-ai
 
 photo_2026-09-28_23-12-27.jpg
+
+01-step1-empty.png
+02-step1-configured.png
+img
+TW_Impact_Study_V3_LONG_MAT_YA_MAT_TY.xlsx
+mapping_fixture_5cat.xlsx

@@ -1841,6 +1841,227 @@ def part11() -> None:
 
 
 # ===========================================================================
+# PART 12 - the periods may live in the *rows*, not in the column names
+#
+# Two workbook conventions exist and both must work. The reference workbook is
+# the **wide** one: the periods are columns (`Sales Value YA`, `Sales Value`) and
+# its `Periods` column says `MAT TY` on every row. The **long** one has a single
+# metric column and a `Periods` column that says which period each row is.
+#
+# Part 11 proves the wide convention. This proves the long one - which is the
+# case a workbook with no `Sales Value YA` / `Sales Value 2YA` column falls into,
+# and the one that used to be refused with "column 'Sales Value YA' does not
+# exist". The numbers are chosen so a same-column read is distinguishable from a
+# real one: CAT_A is MAT YA 150 / MAT TY 170, so a collapsed read reports 0%
+# where the answer is +13.33%.
+# ===========================================================================
+
+
+def part12() -> None:
+    banner("PART 12  the periods may be rows: MAT YA / MAT TY from the Periods column")
+
+    def long_frame() -> pd.DataFrame:
+        """One metric column, the period in the rows. No YA / 2YA column."""
+        rows = []
+        for man, ya, ty in (("M1", 100.0, 110.0), ("M2", 50.0, 60.0)):
+            for period, val in (("MAT YA", ya), ("MAT TY", ty)):
+                rows.append({"CATEGORY": "C1", "MKT": "TOTAL", "MF": man,
+                             "Periods": period, "Sales Value": val})
+        return pd.DataFrame(rows)
+
+    def cfg(**kw) -> A.AnalysisConfig:
+        base = dict(
+            metric_label="Sales Value", metric_key="sales_value",
+            a_prior="", a_current="", b_prior="", b_current="",
+            category_col="CATEGORY", market_col="MKT", manufacturer_col="MF",
+            period_col="Periods", markets=["TOTAL"], categories=["C1"], top_n=2,
+        )
+        base.update(kw)
+        return A.AnalysisConfig(**base)
+
+    frame = long_frame()
+
+    # --- resolution: one column, both slots --------------------------------
+    check("a single metric column supplies both periods from the rows",
+          A.resolve_mat_slots("", "", "", "", frame, frame, "Sales Value",
+                              "Periods", "Periods")
+          == ("Sales Value", "Sales Value", "Sales Value", "Sales Value"),
+          str(A.resolve_mat_slots("", "", "", "", frame, frame, "Sales Value",
+                                  "Periods", "Periods")))
+    # Without *any* period column the same frame is one period, not two: the
+    # positional fallback must not invent a year ago out of the one column. (The
+    # period column above is found from the data even when it was not wired, so
+    # the only way to be period-less is for the frame not to carry one.)
+    no_pcol = frame.drop(columns=["Periods"])
+    check("without any period column the one metric column is one period, not two",
+          A.resolve_mat_slots("", "", "", "", no_pcol, no_pcol, "Sales Value")[0] == "",
+          str(A.resolve_mat_slots("", "", "", "", no_pcol, no_pcol, "Sales Value")))
+    # The period column is found from the data when it was not wired, so a
+    # client that sent nothing still gets the row convention.
+    check("the period column is detected from the data when unwired",
+          P.detect_period_column(frame, "") == "Periods",
+          repr(P.detect_period_column(frame, "")))
+
+    # --- the values are the sums of that period's rows ---------------------
+    c = cfg()
+    notes = A._resolve_period_columns(c, frame, frame)
+    check("both slots land on the one column, so the rows separate them",
+          c.a_prior == c.a_current == "Sales Value",
+          f"{c.a_prior!r} / {c.a_current!r}")
+    check("the row-based slots are not reported as a degenerate wiring",
+          not any("used twice" in n for n in notes), str(notes))
+    prep = A.prepare(frame, frame, c)
+    tot = A.category_report(prep, "C1")["total"]
+    check("MAT YA is the sum of the MAT YA rows only",
+          abs(tot["before_prior"] - 150.0) < 1e-9, f"got {tot['before_prior']}")
+    check("MAT TY is the sum of the MAT TY rows only",
+          abs(tot["before_current"] - 170.0) < 1e-9, f"got {tot['before_current']}")
+    check("growth is the real MAT YA -> MAT TY move (+13.33%), not 0%",
+          tot["before_growth_pct"] is not None
+          and abs(tot["before_growth_pct"] - 13.3333333) < 1e-4,
+          f"got {tot['before_growth_pct']}")
+
+    # --- a ranked row carries both periods of both sides --------------------
+    top = A.category_report(prep, "C1")["manufacturer_top_n"]
+    m1 = next((r for r in top if r["name"] == "M1"), {})
+    check("a Top-N row carries BEFORE MAT YA and MAT TY from the rows",
+          abs((m1.get("before_prior") or 0) - 100.0) < 1e-9
+          and abs((m1.get("before_current") or 0) - 110.0) < 1e-9,
+          f"{m1.get('before_prior')} / {m1.get('before_current')}")
+    check("the Top-N still selects on A's MAT TY (M1 110 > M2 60)",
+          [r["name"] for r in top] == ["M1", "M2"], str([r["name"] for r in top]))
+
+    # --- a rate metric must mask its weight too -----------------------------
+    # A row-based frame carries one weight per *row*, so an unmasked denominator
+    # sums both periods and halves the level: 10 and 30 over two MAT YA rows
+    # average to 20, not 10.
+    rate = pd.DataFrame({
+        "CATEGORY": ["C1"] * 4, "MKT": ["TOTAL"] * 4,
+        "MF": ["M1", "M1", "M2", "M2"],
+        "Periods": ["MAT YA", "MAT TY", "MAT YA", "MAT TY"],
+        "ND Dist": [10.0, 20.0, 30.0, 40.0],
+        "Sales Value": [100.0] * 4,
+    })
+    rc = A.AnalysisConfig(
+        metric_label="ND Dist", a_prior="ND Dist", a_current="ND Dist",
+        b_prior="ND Dist", b_current="ND Dist", is_rate=True,
+        growth_applicable=False, weight_metric="Sales Value",
+        category_col="CATEGORY", market_col="MKT", manufacturer_col="MF",
+        period_col="Periods", markets=["TOTAL"], categories=["C1"], top_n=2)
+    rtot = A.category_report(A.prepare(rate, rate, rc), "C1")["total"]
+    check("a row-based rate metric weights each period by its own rows",
+          abs(rtot["before_prior"] - 20.0) < 1e-9
+          and abs(rtot["before_current"] - 30.0) < 1e-9,
+          f"MAT YA {rtot['before_prior']} (want 20) / MAT TY {rtot['before_current']} (want 30)")
+
+    # --- the wide convention is untouched -----------------------------------
+    # Same shape, but with the periods as columns: the row-based filter must not
+    # engage, or every existing workbook's numbers would move.
+    wide = pd.DataFrame({
+        "CATEGORY": ["C1", "C1"], "MKT": ["TOTAL", "TOTAL"], "MF": ["M1", "M2"],
+        "Periods": ["MAT TY", "MAT TY"],
+        "Sales Value YA": [10.0, 20.0], "Sales Value": [40.0, 25.0],
+    })
+    wc = cfg(a_prior="Sales Value YA", a_current="Sales Value",
+             b_prior="Sales Value YA", b_current="Sales Value")
+    wprep = A.prepare(wide, wide, wc)
+    wtot = A.category_report(wprep, "C1")["total"]
+    check("a wide workbook still reads the YA column, unfiltered",
+          abs(wtot["before_prior"] - 30.0) < 1e-9
+          and abs(wtot["before_current"] - 65.0) < 1e-9,
+          f"{wtot['before_prior']} / {wtot['before_current']}")
+    check("the wide workbook reports no degenerate wiring either",
+          not any("used twice" in n for n in wprep.notes), str(wprep.notes))
+
+
+# ===========================================================================
+# PART 13 - the run notes state the scope, not a fault
+#
+# A row whose category was left unmapped has no counterpart to compare against,
+# so it cannot produce an impact figure - and it leaves the frame. Reported as
+# "80437 row(s) dropped because their category was excluded" it read as data
+# loss, and it was rendered under a "Check the period wiring" heading, which is
+# not even what it is about. The user's words: *"it is currently creating low
+# confidence in my impact"*.
+#
+# The note is a **scope** statement and must read as one: how much of the data
+# the figures cover, with the denominator. Nothing changes silently - the fact
+# is still reported, it just says what it is.
+# ===========================================================================
+
+
+def part13() -> None:
+    banner("PART 13  a partial mapping is reported as scope, not as rows dropped")
+
+    from backend.category_mapping import ukey
+
+    def frame() -> pd.DataFrame:
+        return pd.DataFrame({
+            "CATEGORY": ["C1", "C2", "C3"],
+            "MKT": ["TOTAL"] * 3,
+            "Sales Value YA": [10.0, 20.0, 30.0],
+            "Sales Value": [11.0, 22.0, 33.0],
+        })
+
+    def cfg(**kw) -> A.AnalysisConfig:
+        base = dict(
+            metric_label="Sales Value", metric_key="sales_value",
+            a_prior="Sales Value YA", a_current="Sales Value",
+            b_prior="Sales Value YA", b_current="Sales Value",
+            category_col="CATEGORY", market_col="MKT",
+            markets=["TOTAL"], categories=["C1", "C2", "C3"],
+        )
+        base.update(kw)
+        return A.AnalysisConfig(**base)
+
+    df = frame()
+    # C1 mapped; C2 and C3 left out. Four of six rows are outside the analysis.
+    partial = cfg(category_map_a={ukey("C1", ""): "C1"},
+                  category_excluded_a=[ukey("C2", ""), ukey("C3", "")])
+    notes = A.prepare(df, df, partial).notes
+    scope = [n for n in notes if "categories you mapped" in n]
+    check("a partial mapping reports the scope it covers",
+          len(scope) == 1, str(notes))
+    check("...with the denominator and the count, not a bare 'rows dropped'",
+          bool(scope) and "of 6 rows" in scope[0] and "row(s) dropped" not in scope[0],
+          scope[0] if scope else "")
+    check("...and it says what to do about it",
+          bool(scope) and "step 4" in scope[0], scope[0][-60:] if scope else "")
+    # The figures themselves must still cover the mapped category only.
+    prep = A.prepare(df, df, partial)
+    check("the analysis covers the mapped category only",
+          A.category_report(prep, "C1")["total"]["before_current"] == 11.0,
+          str(A.category_report(prep, "C1")["total"]["before_current"]))
+
+    # Everything mapped -> nothing to report.
+    full = cfg(category_map_a={ukey("C1", ""): "C1", ukey("C2", ""): "C2",
+                              ukey("C3", ""): "C3"})
+    notes_full = A.prepare(df, df, full).notes
+    check("a complete mapping reports no scope note",
+          not any("categories you mapped" in n for n in notes_full),
+          str(notes_full))
+
+    # A tiny share must not print as "0.0%", which reads as a rounding error.
+    # The fixture has to *cross* the 0.05% boundary or it proves nothing: one
+    # row out of 4,002 is 0.025%, which rounds to 0.0% at one decimal place. A
+    # 1-in-202 fixture (0.5%) would pass this assertion on the old code too.
+    wide = pd.DataFrame({
+        "CATEGORY": ["C1"] * 2000 + ["C2"],
+        "MKT": ["TOTAL"] * 2001,
+        "Sales Value YA": [1.0] * 2001,
+        "Sales Value": [1.0] * 2001,
+    })
+    tiny = cfg(category_map_a={ukey("C1", ""): "C1"},
+               category_excluded_a=[ukey("C2", "")],
+               categories=["C1"])
+    note_tiny = [n for n in A.prepare(wide, wide, tiny).notes
+                 if "categories you mapped" in n]
+    check("a negligible share reads as '<0.1%', not '0.0%'",
+          bool(note_tiny) and "<0.1%" in note_tiny[0] and "0.0%" not in note_tiny[0],
+          note_tiny[0] if note_tiny else "")
+
+
+# ===========================================================================
 # PART 10 - the Total Market is printed once, at the head of the block
 #
 # A stacked source file carries a Total row *and* the rows it covers. The block
@@ -1991,6 +2212,8 @@ def main() -> int:
     part9()
     part10()
     part11()
+    part12()
+    part13()
     banner("SUMMARY")
     n_pass = sum(1 for _, s, _ in results if s == PASS)
     n_fail = len(results) - n_pass
