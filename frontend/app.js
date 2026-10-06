@@ -683,6 +683,12 @@ function renderMarketPairing() {
           ? `Hierarchy read from ${esc(S.marketPathSource || 'the workbook')}, shown as advice only.`
           : 'No hierarchy column was found, so levels come from your choices alone.'}
       </p>
+      <p class="hint" style="margin-top:4px">
+        This level pre-selects which markets the analysis starts with, in step 5.
+        Whichever markets are ticked there are what it actually covers — and the
+        updated dataset is read for the counterparts of <em>those</em> markets, so
+        the before and after columns always measure the same set.
+      </p>
     </div>
 
     <div class="card">
@@ -2192,9 +2198,30 @@ function renderMetricSection(m, ordinal, totalMetrics) {
         <div class="k-sub">on MAT TY</div></div>
     </div>
 
+    <p class="hint" style="margin:2px 0 10px">${measuredNote(m)}</p>
+
     ${renderMarketBlocks(m, disp, g)}
     ${renderEntities(m, { disp, g })}
   `;
+}
+
+/**
+ * Which rows the headline was measured on.
+ *
+ * A stacked workbook carries the Total Market row *and* the channels it covers,
+ * so "the category total" is ambiguous: the Total Market's own rows, or the sum
+ * of everything in scope. The two differ by the channels the total already
+ * contains (~1.48x on the reference file). Stating it beside the figures is what
+ * lets a reader reconcile a Top-N against the headline.
+ */
+function measuredNote(m) {
+  if (m.measured_on === 'total_market') {
+    const name = (m.baseline || {}).name;
+    return `Measured on the Total Market${name ? ' · ' + esc(name) : ''} — the `
+      + 'channels beneath it are not added to it again.';
+  }
+  return 'Measured as the sum of every market in scope, including any market '
+    + 'that is itself a total.';
 }
 
 /**

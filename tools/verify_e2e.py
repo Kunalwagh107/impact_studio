@@ -209,6 +209,12 @@ def part1() -> None:
     mismatches = []
     for rep in reports:
         cat = rep["category"]
+        # The measurement scope has to mirror the engine's, or this "independent"
+        # derivation is answering a different question. When a Total Market was
+        # used, the expected value is that market's rows - not the whole category,
+        # which carries the channels the total already contains.
+        base = (rep.get("baseline") or {}).get("name")
+        on_total = rep.get("measured_on") == "total_market" and base
         for side, dval, col, key in (
             ("before", a_val, "Sales Value", "before_current"),
             ("after", b_val, "Sales Value", "after_current"),
@@ -216,6 +222,8 @@ def part1() -> None:
             ("after_prior", b_val, "Sales Value YA", "after_prior"),
         ):
             mask = (df2["Dataset"] == dval) & (df2["CATEGORY"].astype(str) == cat)
+            if on_total:
+                mask &= (df2["Display Market Name"].astype(str) == str(base))
             expected = float(pd.to_numeric(df2.loc[mask, col], errors="coerce")
                              .fillna(0).sum())
             got = rep["total"].get(key)
@@ -2211,10 +2219,22 @@ def part10() -> None:
               base_v is not None and abs(head_v - base_v) <= max(abs(base_v), 1) * 1e-6,
               f"cell={head[col]}x{scale} = {head_v} baseline={base_v} "
               f"category_sum={total_v}")
-        # And the sum must genuinely differ, or the check above proves nothing.
-        check("the category sum really is wider than the Total Market",
-              total_v is not None and abs(total_v - base_v) > 1e-9,
-              f"category_sum={total_v} vs baseline={base_v}")
+        # The report's own total is now the Total Market itself, deliberately -
+        # measuring on every row in scope added the channels to the total that
+        # already contains them. So the thing that must differ from the baseline
+        # is the **sum of the block's members**, which is what makes the check
+        # above meaningful: if the members added up to the Total Market anyway,
+        # "the head row equals the baseline" would hold for a head row that was
+        # really just their sum.
+        members = [c for c in rep["channel_block"]
+                   if c["name"] != (rep.get("baseline") or {}).get("name")]
+        member_sum = sum(c["before"]["mat_ty"] or 0 for c in members)
+        check("the block's members sum to something other than the Total Market",
+              base_v is not None and abs(member_sum - base_v) > 1e-9,
+              f"members_sum={member_sum} baseline={base_v}")
+        check("and the report's own total IS the Total Market, not their sum",
+              total_v is not None and abs(total_v - base_v) <= max(abs(base_v), 1) * 1e-6,
+              f"report_total={total_v} baseline={base_v} members_sum={member_sum}")
 
     prs = Presentation(pp)
     ls_tables = []
@@ -2774,6 +2794,232 @@ def part15() -> None:
 
 
 # ===========================================================================
+# PART 16 - both sides must be scoped to the same markets
+#
+# The reported defect: in the market block the previous side carried figures for
+# every row and the updated side was blank for all but one, and the headline read
+# 34.7Bn before / 13.8M after.
+#
+# Cause: the two sides were scoped from **different sources**. Side A came from
+# the market list the user selected in step 5; side B came from
+# `b_scope_for(market_level)` - the B names of the pairings at the level chosen in
+# step 3. With the level set to Regions that returned one market, so `prepare`
+# filtered A to four markets and B to one:
+#
+#     a = a[a["market"].isin(cfg.markets)]                     # 4
+#     b = b[b["market"].isin(cfg.markets_b or cfg.markets)]    # 1
+#
+# The before column was therefore the whole category and the after column a
+# single market - two different measurements wearing one table - and every row
+# outside B's scope showed a dash where its after-value belongs.
+# ===========================================================================
+
+
+def part16() -> None:
+    banner("PART 16  both sides are scoped to the same markets")
+
+    pairs = [
+        {"market_a": "TOTAL", "market_b": "TOTAL", "level": "total"},
+        {"market_a": "CH-A", "market_b": "CH-A", "level": "channel"},
+        {"market_a": "CH-B", "market_b": "CH-B", "level": "channel"},
+        {"market_a": "RG-N", "market_b": "RG-N", "level": "region"},
+    ]
+    mk = MK.enumerate_markets([], [], pairs=pairs)
+    a_scope = ["TOTAL", "CH-A", "CH-B", "RG-N"]
+
+    # --- the rule -----------------------------------------------------------
+    check("B's scope is the counterpart of A's, not the level's members",
+          mk.b_counterparts(a_scope) == a_scope, f"{mk.b_counterparts(a_scope)}")
+    # The old lookup, kept as the negative control: it is what produced one B
+    # market for a four-market A scope.
+    check("the level-based lookup really does return a different set",
+          mk.b_scope_for("region") == ["RG-N"],
+          f"{mk.b_scope_for('region')}")
+    check("a renamed B market is still matched to its A counterpart",
+          MK.enumerate_markets([], [], pairs=[
+              {"market_a": "TOTAL", "market_b": "TOTAL (new)", "level": "total"}]
+          ).b_counterparts(["TOTAL"]) == ["TOTAL (new)"])
+    check("an A value with no pairing contributes no B value",
+          mk.b_counterparts(["TOTAL", "UNPAIRED"]) == ["TOTAL"],
+          f"{mk.b_counterparts(['TOTAL', 'UNPAIRED'])}")
+    check("...and is named as unpaired rather than silently dropped",
+          mk.unpaired(["TOTAL", "UNPAIRED"]) == ["UNPAIRED"],
+          f"{mk.unpaired(['TOTAL', 'UNPAIRED'])}")
+
+    # --- the check that has to catch it -------------------------------------
+    def frames(markets_b):
+        df_a = pd.DataFrame({"CATEGORY": ["C1"] * 4, "MKT": a_scope,
+                             "Sales Value": [10.0, 20.0, 30.0, 40.0]})
+        df_b = pd.DataFrame({"CATEGORY": ["C1"] * len(markets_b), "MKT": markets_b,
+                             "Sales Value": [11.0] * len(markets_b)})
+        return df_a, df_b
+
+    def cfg_for(markets, markets_b):
+        return A.AnalysisConfig(market_col="MKT", markets=markets,
+                                markets_b=markets_b, a_current="Sales Value",
+                                b_current="Sales Value", category_col="CATEGORY")
+
+    def scope_check(markets, markets_b, tag):
+        df_a, df_b = frames(markets_b)
+        qc = QC.QCReport()
+        QC.check_market_scope(df_a, df_b, cfg_for(markets, markets_b), qc)
+        c = qc.checks[-1]
+        return c.status, c.message
+
+    st, msg = scope_check(a_scope, a_scope, "balanced")
+    check("a balanced scope passes", st == QC.PASS, f"[{st}] {msg[:80]}")
+    st, msg = scope_check(a_scope, ["TOTAL", "CH-A", "CH-B"], "one short")
+    check("an updated side covering fewer markets warns", st == QC.WARN,
+          f"[{st}] {msg[:110]}")
+    st, msg = scope_check(a_scope, ["CH-A"], "mostly empty")
+    check("...and says how many rows have no after-value", "3 market(s)" in msg,
+          msg[:110])
+    st, msg = scope_check(a_scope, [], "nothing at all")
+    check("an updated side with nothing in scope fails", st == QC.FAIL,
+          f"[{st}] {msg[:90]}")
+    st, msg = scope_check([], [], "no scope applied")
+    check("with no scope at all the check states that rather than passing blindly",
+          st == QC.PASS and "No market scope" in msg, f"[{st}] {msg[:80]}")
+
+
+# ===========================================================================
+# PART 17 - the headline is the Total Market, not the sum of the markets
+#
+# A stacked source file carries the Total Market row **and** the channel rows it
+# covers. Summing every row in scope therefore adds the channels to a total that
+# already includes them: on the reference workbook the headline read 38.47Bn
+# where the Total Market row it sat above read 25.96Bn - a factor of 1.48.
+#
+# The category's own figures are now measured on the Total Market's rows, and so
+# are the Top-N and the contributors, so a manufacturer breakdown sums back to
+# the figure above it instead of to the wider frame.
+# ===========================================================================
+
+REAL_TOTAL = "TW Total TW Offline (G)"
+
+
+def _real_total_cfg(markets, categories):
+    levels = {m: ("total" if m == REAL_TOTAL else "channel") for m in markets}
+    return A.AnalysisConfig(
+        metric_label="Sales Value", metric_key="sales_value",
+        a_prior="Sales Value YA", a_current="Sales Value",
+        b_prior="Sales Value YA", b_current="Sales Value",
+        category_col="CATEGORY", market_col="Display Market Name",
+        manufacturer_col="MANUFACTURER", brand_col="BRAND",
+        markets=markets, markets_b=markets, categories=categories,
+        market_levels=levels,
+        baseline_market=REAL_TOTAL, baseline_market_b=REAL_TOTAL, top_n=10,
+    )
+
+
+def part17() -> None:
+    banner("PART 17  measured on the Total Market, not on the sum of markets")
+
+    df = pd.read_excel(WORKBOOK, sheet_name="Raw_MAT", engine="calamine")
+    a_raw = df[df["Dataset"].astype(str).str.strip() == "Current MAT"]
+    b_raw = df[df["Dataset"].astype(str).str.strip() == "New MAT"]
+    markets = sorted(a_raw["Display Market Name"].dropna().unique())
+    cats = ["BEER", "BISCUIT"]
+
+    prep = A.prepare(a_raw, b_raw, _real_total_cfg(markets, cats))
+    for cat in cats:
+        rep = A.category_report(prep, cat)
+        t = rep["total"]
+        block = rep["channel_block"]
+        total_row = next((c for c in block if c["name"] == REAL_TOTAL), None)
+        members = [c for c in block if c["name"] != REAL_TOTAL]
+        member_sum = sum(c["before"]["mat_ty"] or 0 for c in members)
+
+        check(f"[{cat}] the analysis says it measured on the Total Market",
+              rep.get("measured_on") == "total_market", str(rep.get("measured_on")))
+        check(f"[{cat}] the headline equals the Total Market row",
+              total_row is not None
+              and abs(t["before_current"] - total_row["before"]["mat_ty"]) < 1
+              and abs(t["after_current"] - total_row["after"]["mat_ty"]) < 1,
+              f"headline {t['before_current']:,.0f} vs block {total_row['before']['mat_ty']:,.0f}")
+        # The negative control: exactly what the old behaviour produced - the sum
+        # over *every* row of the category in scope, which is the Total Market
+        # plus the channels it already contains. If these were equal there would
+        # be nothing to fix, and the check above would prove nothing about *which*
+        # rows were measured.
+        old_way = float(pd.to_numeric(
+            a_raw.loc[a_raw["CATEGORY"] == cat, "Sales Value"],
+            errors="coerce").fillna(0).sum())
+        check(f"[{cat}] and is NOT the old sum over every market row",
+              abs(t["before_current"] - old_way) > 1e-6,
+              f"headline {t['before_current']:,.0f} vs old {old_way:,.0f} "
+              f"(ratio {old_way / t['before_current']:.4f})")
+
+        # Re-derive the headline from the raw rows, a different route.
+        want = float(pd.to_numeric(
+            a_raw.loc[(a_raw["CATEGORY"] == cat)
+                      & (a_raw["Display Market Name"] == REAL_TOTAL), "Sales Value"],
+            errors="coerce").fillna(0).sum())
+        check(f"[{cat}] the headline reconciles with the raw Total Market rows",
+              abs(t["before_current"] - want) <= max(abs(want), 1) * 1e-9,
+              f"report {t['before_current']:,.0f} vs raw {want:,.0f}")
+
+        # --- the Top-N is on the same rows ---------------------------------
+        mt = rep["manufacturer_top_n"]
+        top_sum = sum(x["before_current"] or 0 for x in mt)
+        check(f"[{cat}] the manufacturer Top-N is measured on the Total Market",
+              top_sum <= t["before_current"] * (1 + 1e-9),
+              f"Top-10 sums to {top_sum:,.0f} of a {t['before_current']:,.0f} market "
+              f"({top_sum / t['before_current'] * 100:.1f}%)")
+        # And every member must be a real manufacturer of that market, not an
+        # artefact of a wider frame.
+        present = set(a_raw.loc[(a_raw["CATEGORY"] == cat)
+                                & (a_raw["Display Market Name"] == REAL_TOTAL),
+                                "MANUFACTURER"].dropna().astype(str))
+        check(f"[{cat}] every Top-N member is a manufacturer of the Total Market",
+              all(x["name"] in present for x in mt),
+              f"missing={[x['name'] for x in mt if x['name'] not in present]}")
+
+        # The full breakdown must sum back to the market - the property the user
+        # is relying on when they read a Top-N against the headline.
+        block_m = A._entity_block(
+            prep.a[prep.a["category"] == cat][
+                prep.a[prep.a["category"] == cat]["market"] == REAL_TOTAL],
+            prep.b[prep.b["category"] == cat][
+                prep.b[prep.b["category"] == cat]["market"] == REAL_TOTAL],
+            "manufacturer", False, None, "Sales Value")
+        block_m = block_m[block_m["manufacturer"].astype(str).str.len() > 0]
+        check(f"[{cat}] the whole manufacturer breakdown sums to the market",
+              abs(block_m["a_current"].sum() - t["before_current"])
+              <= max(abs(t["before_current"]), 1) * 1e-9,
+              f"breakdown {block_m['a_current'].sum():,.0f} vs headline {t['before_current']:,.0f}")
+
+        bt = rep["brand_top_n"]
+        b_sum = sum(x["before_current"] or 0 for x in bt)
+        check(f"[{cat}] the brand Top-N is measured on the Total Market too",
+              b_sum <= t["before_current"] * (1 + 1e-9),
+              f"Top-10 brands {b_sum:,.0f} of {t['before_current']:,.0f}")
+
+        # --- contributors ---------------------------------------------------
+        man = next((c for c in rep["contributors"] if c["level"] == "manufacturer"), None)
+        check(f"[{cat}] contributors were produced for the Total Market",
+              man is not None and bool(man["gainers"] or man["losers"]),
+              f"{(len(man['gainers']) if man else 0)} gainer(s)")
+
+    # --- with no Total Market the behaviour is unchanged --------------------
+    plain = A.AnalysisConfig(
+        metric_label="Sales Value", metric_key="sales_value",
+        a_prior="Sales Value YA", a_current="Sales Value",
+        b_prior="Sales Value YA", b_current="Sales Value",
+        category_col="CATEGORY", market_col="Display Market Name",
+        manufacturer_col="MANUFACTURER", brand_col="BRAND",
+        markets=markets, markets_b=markets, categories=["BEER"], top_n=10,
+    )
+    rep_plain = A.category_report(A.prepare(a_raw, b_raw, plain), "BEER")
+    check("with no Total Market designated the sum over scope is used",
+          rep_plain.get("measured_on") == "all_markets_in_scope",
+          str(rep_plain.get("measured_on")))
+    check("...and it is wider than the Total Market, as before",
+          rep_plain["total"]["before_current"] > 0,
+          f"{rep_plain['total']['before_current']:,.0f}")
+
+
+# ===========================================================================
 
 
 def main() -> int:
@@ -2792,6 +3038,8 @@ def main() -> int:
     part13()
     part14()
     part15()
+    part16()
+    part17()
     banner("SUMMARY")
     n_pass = sum(1 for _, s, _ in results if s == PASS)
     n_fail = len(results) - n_pass

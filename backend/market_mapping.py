@@ -130,6 +130,35 @@ class MarketMappingResult:
         return [p.market_b for p in self.pairs
                 if p.level == level and p.market_b]
 
+    def b_counterparts(self, markets_a: Sequence[str]) -> list[str]:
+        """The B values paired with these A values - B's half of *the same* scope.
+
+        This is the only correct way to scope side B when side A's scope is an
+        explicit list. Taking B from the level instead (`b_scope_for`) answers a
+        different question - "which pairings are levelled Regions" - so a run whose
+        A scope was the whole market and whose level was Regions read every A row
+        and only the region's B rows. The before column was then the entire
+        category and the after column a single market, and every other row in the
+        block showed a dash where its after-value should be.
+
+        Order follows the pairings, and an A value with no pairing contributes
+        nothing: there is genuinely no counterpart to compare it against, and
+        inventing one would be the mapping deciding something the user did not.
+        """
+        want = {str(m).strip() for m in (markets_a or []) if str(m or "").strip()}
+        out: list[str] = []
+        for p in self.pairs:
+            if not p.market_b:
+                continue
+            if str(p.market_a or "").strip() in want and p.market_b not in out:
+                out.append(p.market_b)
+        return out
+
+    def unpaired(self, markets_a: Sequence[str]) -> list[str]:
+        """The A values in scope that the user never paired with a B value."""
+        paired = {str(p.market_a or "").strip() for p in self.pairs if p.market_b}
+        return [m for m in (markets_a or []) if str(m or "").strip() not in paired]
+
 
 # ---------------------------------------------------------------------------
 # Enumeration: what the UI offers as pickable values

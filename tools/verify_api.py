@@ -323,6 +323,63 @@ def main() -> int:
           f"-> after {r0['total']['after_current']:,.0f}  "
           f"level shift {r0['total']['level_shift_pp']:+.2f}pp")
 
+    # --- 5b. both sides scoped to the same markets --------------------------
+    # The reported defect lived exactly here: side A took its scope from the
+    # market list, side B from the *level* chosen in step 3. With the level set to
+    # Regions that read every market in the previous dataset and only the region's
+    # rows in the updated one, so the before column was the whole category, the
+    # after column one market, and every other row in the block showed a dash
+    # where its after-value belongs.
+    #
+    # The fixture is deliberately the shape that produced it: every market
+    # selected, and exactly one of them levelled `region`.
+    all_markets = sorted(mk.get("values_a") or [],
+                         key=lambda m: (0 if "total" in str(m).lower() else 1, str(m)))
+    if len(all_markets) >= 2:
+        scoped_pairs = (
+            [{"market_a": all_markets[0], "market_b": all_markets[0], "level": "total"}]
+            + [{"market_a": m, "market_b": m, "level": "channel"}
+               for m in all_markets[1:-1]]
+            + [{"market_a": all_markets[-1], "market_b": all_markets[-1],
+                "level": "region"}])
+        scoped = post(base, "/api/run", {
+            **run_req,
+            "markets": all_markets,
+            "market_level": "region",
+            "market_pairs": scoped_pairs,
+            "baseline_market": all_markets[0],
+            "mapping_a": {"market": {p["market_a"]: p["market_b"]
+                                     for p in scoped_pairs}},
+        }, timeout=900)
+        sr = scoped["reports"][0]
+        cb = sr.get("channel_block") or []
+
+        # The defect, stated exactly: a row carrying a before-value and no
+        # after-value. A market absent from *both* sides is a different thing -
+        # legitimate sparsity in one category - so it is not asserted against.
+        one_sided = [b["name"] for b in cb
+                     if b["before"]["mat_ty"] is not None
+                     and b["after"]["mat_ty"] is None]
+        check("no market in scope has a before-value but no after-value",
+              bool(cb) and not one_sided, f"missing after-value: {one_sided}")
+
+        # The headline symptom: the after column three orders of magnitude below
+        # the before column, because they were measuring different sets.
+        bf, af = sr["total"]["before_current"], sr["total"]["after_current"]
+        check("the headline's two sides are on the same scale",
+              bf and af and af > bf * 0.1,
+              f"{bf:,.0f} -> {af:,.0f}")
+
+        ms_scope = next((c for c in scoped["qc"]["checks"]
+                         if c["name"] == "Market scope"), None)
+        check("the market-scope check ran and passed",
+              bool(ms_scope) and ms_scope["status"] == "PASS",
+              f"{ms_scope['status']}: {ms_scope['message'][:90]}"
+              if ms_scope else "check absent")
+    else:
+        check("market values enumerated for the scope case", False,
+              f"only {len(all_markets)} market value(s)")
+
     # --- 6. bulk export -----------------------------------------------------
     t0 = time.time()
     exp = post(base, "/api/export", {**run_req, "run_name": "api_bulk_run",

@@ -1145,6 +1145,46 @@ def _insights(
     ]
 
 
+def _total_market_names(cfg) -> set[str]:
+    """Every market value that represents the Total Market, on either side."""
+    names = {(cfg.baseline_market or "").strip(),
+             (cfg.baseline_market_b or "").strip()}
+    names |= {str(m) for m, lvl in (cfg.market_levels or {}).items()
+              if str(lvl or "").lower() == "total"}
+    return {n for n in names if n}
+
+
+def _measure_frames(a: pd.DataFrame, b: pd.DataFrame, cfg):
+    """The rows the category's *own* figures are measured on.
+
+    A stacked source file carries the Total Market row **and** the channel rows it
+    covers, so summing the frame adds the channels to a total that already
+    includes them. On the reference workbook that is a factor of 1.48 - the
+    headline read 38.47Bn where the Total Market row it was compared against read
+    25.96Bn - and it is the same double count the block layout avoids by never
+    repeating the Total among its own members.
+
+    When a Total Market is designated, the measurement is its rows. The headline,
+    the Top-N and the contributors then agree with the row the block leads with,
+    and a manufacturer or brand breakdown sums back to the figure above it.
+
+    Both sides must have such a row. Measuring A on its total and B on everything
+    would compare a total against a set of channels - precisely the mismatch the
+    market scope work removed - so if either side lacks one, both fall back to the
+    full frame and the caller reports that no Total Market was used.
+    """
+    names = _total_market_names(cfg)
+    if not names or a.empty or b.empty:
+        return a, b, False
+    if "market" not in a.columns or "market" not in b.columns:
+        return a, b, False
+    ta = a[a["market"].astype(str).isin(names)]
+    tb = b[b["market"].astype(str).isin(names)]
+    if ta.empty or tb.empty:
+        return a, b, False
+    return ta, tb, True
+
+
 def category_report(prep: Prepared, category: str) -> dict:
     """The complete impact story for one category."""
     cfg = prep.cfg
@@ -1158,14 +1198,19 @@ def category_report(prep: Prepared, category: str) -> dict:
     # rather than quietly presenting a share of the wrong denominator.
     base_a, base_b = prep.baseline.get(category, (None, None))
 
+    # The rows the category's own figures are measured on: the Total Market's,
+    # not every row in scope. See `_measure_frames` - summing a stacked file adds
+    # the channels to the total that already contains them.
+    a_measure, b_measure, on_total = _measure_frames(a, b, cfg)
+
     # Category totals (before/after) ------------------------------------------
     tot = {
-        "before_prior": _f(a["prior"].sum(min_count=1)),
-        "before_current": _f(a["current"].sum(min_count=1)),
-        "after_prior": _f(b["prior"].sum(min_count=1)),
-        "after_current": _f(b["current"].sum(min_count=1)),
-        "rows_before": int(len(a)),
-        "rows_after": int(len(b)),
+        "before_prior": _f(a_measure["prior"].sum(min_count=1)),
+        "before_current": _f(a_measure["current"].sum(min_count=1)),
+        "after_prior": _f(b_measure["prior"].sum(min_count=1)),
+        "after_current": _f(b_measure["current"].sum(min_count=1)),
+        "rows_before": int(len(a_measure)),
+        "rows_after": int(len(b_measure)),
     }
     if cfg.is_rate:
         def _rate_total(frame: pd.DataFrame, slot: str) -> float | None:
@@ -1181,10 +1226,10 @@ def category_report(prep: Prepared, category: str) -> dict:
             den = w.sum()
             return _f((frame[slot] * w).sum() / den) if den else None
 
-        tot["before_prior"] = _rate_total(a, "prior")
-        tot["before_current"] = _rate_total(a, "current")
-        tot["after_prior"] = _rate_total(b, "prior")
-        tot["after_current"] = _rate_total(b, "current")
+        tot["before_prior"] = _rate_total(a_measure, "prior")
+        tot["before_current"] = _rate_total(a_measure, "current")
+        tot["after_prior"] = _rate_total(b_measure, "prior")
+        tot["after_current"] = _rate_total(b_measure, "current")
 
     if cfg.growth_applicable:
         tot["before_growth_pct"] = _safe_growth(tot["before_current"], tot["before_prior"])
@@ -1216,6 +1261,11 @@ def category_report(prep: Prepared, category: str) -> dict:
         "is_rate_metric": cfg.is_rate,
         "growth_applicable": bool(cfg.growth_applicable),
         "markets": cfg.markets,
+        # Which rows the category's own figures came from. A reader of the
+        # headline needs to know whether it is the Total Market or the sum of the
+        # markets in scope - the two differ by the channels the total already
+        # contains.
+        "measured_on": "total_market" if on_total else "all_markets_in_scope",
         "total": tot,
         "blocks": {},
         "baseline": {
@@ -1329,8 +1379,13 @@ def category_report(prep: Prepared, category: str) -> dict:
         report["channel_block"] = [_channel_entry(r) for r in flat]
 
     # Subcategory block (when the dimension exists) ---------------------------
+    #
+    # Measured on the same rows as the category total (`a_measure` / `b_measure`),
+    # so the breakdown sums back to the figure above it rather than to the wider
+    # frame that double counts the Total Market's own members.
     if cfg.subcategory_col:
-        sub = _entity_block(a, b, "subcategory", cfg.is_rate, wcol, cfg.metric_label,
+        sub = _entity_block(a_measure, b_measure, "subcategory", cfg.is_rate, wcol,
+                            cfg.metric_label,
                             growth_applicable=cfg.growth_applicable)
         sub = sub[sub["subcategory"].astype(str).str.len() > 0]
         sub = sub.sort_values("b_current", ascending=False, na_position="last")
@@ -1341,7 +1396,8 @@ def category_report(prep: Prepared, category: str) -> dict:
 
     # Manufacturer / brand Top-N ---------------------------------------------
     if cfg.manufacturer_col:
-        mblock = _entity_block(a, b, "manufacturer", cfg.is_rate, wcol, cfg.metric_label,
+        mblock = _entity_block(a_measure, b_measure, "manufacturer", cfg.is_rate,
+                               wcol, cfg.metric_label,
                                growth_applicable=cfg.growth_applicable)
         top, client = _rank_block(mblock, "manufacturer", cfg.top_n, cfg.client_brands)
         report["manufacturer_top_n"] = top
@@ -1350,7 +1406,8 @@ def category_report(prep: Prepared, category: str) -> dict:
         report["n_manufacturers"] = int(len(mblock2))
 
     if cfg.brand_col:
-        bblock = _entity_block(a, b, "brand", cfg.is_rate, wcol, cfg.metric_label,
+        bblock = _entity_block(a_measure, b_measure, "brand", cfg.is_rate, wcol,
+                               cfg.metric_label,
                                growth_applicable=cfg.growth_applicable)
         btop, bclient = _rank_block(bblock, "brand", cfg.top_n, cfg.client_brands)
         report["brand_top_n"] = btop
@@ -1362,7 +1419,8 @@ def category_report(prep: Prepared, category: str) -> dict:
     for dim_key, dim_col in (("manufacturer", "manufacturer"), ("brand", "brand")):
         if not getattr(cfg, f"{dim_key}_col", ""):
             continue
-        blk = _entity_block(a, b, dim_col, cfg.is_rate, wcol, cfg.metric_label,
+        blk = _entity_block(a_measure, b_measure, dim_col, cfg.is_rate, wcol,
+                            cfg.metric_label,
                             growth_applicable=cfg.growth_applicable)
         blk = blk[blk[dim_col].astype(str).str.len() > 0].copy()
         # Gain and Loss are the two sides of the *same* column, selected the same

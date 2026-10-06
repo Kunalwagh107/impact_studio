@@ -219,6 +219,9 @@ def _metric_blocks(report: dict) -> dict[str, dict]:
         "is_rate_metric": report.get("is_rate_metric", False),
         "growth_applicable": report.get("growth_applicable", True),
         "display": report.get("display"),
+        # Whether the figures are the Total Market's own rows or the sum of every
+        # market in scope - the sheet states it, so it has to reach the sheet.
+        "measured_on": report.get("measured_on"),
         # Each metric carries its own baseline, which decides whether the table
         # leads with a Total Market or appends a labelled sum at the foot. Losing
         # it here would silently reinstate the double count this layout exists to
@@ -315,6 +318,24 @@ def _unit_note(disp: dict) -> str:
     return f"Values are in {sym}"
 
 
+def _measured_note(blk: dict) -> str:
+    """Which rows the figures were measured on - stated, not implied.
+
+    A stacked workbook carries the Total Market row *and* the channels it covers,
+    so "the category total" is ambiguous: the Total Market's own rows, or the sum
+    of everything in scope. The two differ by the channels the total already
+    contains (~1.48x on the reference file), and a reader cannot reconcile a
+    Top-N against the headline without knowing which produced it.
+    """
+    if blk.get("measured_on") == "total_market":
+        name = (blk.get("baseline") or {}).get("name")
+        return ("Measured on the Total Market"
+                + (f" · {name}" if name else "")
+                + " - the channels beneath it are not added to it again.")
+    return ("Measured as the sum of every market in scope, including any market "
+            "that is itself a total.")
+
+
 # ----------------------------------------------------------------------------
 
 
@@ -348,6 +369,7 @@ def _sheet_channel(wb, f, blk, cat, metric, mkt_label, disp, sheet_name="Channel
     ws.write(1, 0, f"Category: {cat}   |   Market: {mkt_label}", f["subtitle"])
     ws.write(2, 0, _unit_note(disp) + "   |   One row per market / channel, "
                                       "grouped by level.", f["subtitle"])
+    ws.write(3, 0, _measured_note(blk), f["subtitle"])
 
     if growth_ok:
         headers = ["Entity", "Level", "BEFORE MAT YA", "BEFORE MAT TY",
@@ -402,7 +424,7 @@ def _sheet_channel(wb, f, blk, cat, metric, mkt_label, disp, sheet_name="Channel
         return row + 1
 
     multi = len(tables) > 1
-    r = 4
+    r = 5
     first_header = r
     for title, noun, rows in tables:
         if multi:

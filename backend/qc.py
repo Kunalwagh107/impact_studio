@@ -675,6 +675,65 @@ def check_new_and_exited(reports: Sequence[dict], qc: QCReport) -> None:
            {"entities": notes[:40], "n": len(notes)})
 
 
+def check_market_scope(df_a, df_b, cfg, qc: QCReport) -> None:
+    """Both sides must be scoped to the same markets.
+
+    A before column drawn from a wider set of markets than the after column is
+    not a before/after comparison - it is two different measurements wearing one
+    table. That is exactly what happened when the two sides were scoped from
+    different sources: side A from the market list the user selected, side B from
+    the *level* they picked in step 3. A run scoped to "Regions" then read every
+    market in the previous dataset and only the region's rows in the updated one,
+    so the before column was the whole category, the after column a single
+    market, and every other row in the block showed a dash where its after-value
+    belongs.
+
+    This compares the market values each side actually holds once the scope is
+    applied. Fewer markets on the updated side is reported rather than passed
+    over: the tool's stance is that a one-sided entity is labelled, never
+    silently dropped, and the fix is a pairing in step 3.
+    """
+    col_a = cfg.market_col
+    col_b = cfg.market_col_b or cfg.market_col
+    if not cfg.markets:
+        qc.add("market_scope", "Market scope", PASS,
+               "No market scope was applied, so both sides cover every market "
+               "present in the category.", {"scoped": False})
+        return
+    if not col_a or col_a not in getattr(df_a, "columns", []) \
+            or not col_b or col_b not in getattr(df_b, "columns", []):
+        qc.add("market_scope", "Market scope", WARN,
+               "Not verified: the market column could not be read on both sides, "
+               "so the two scopes were not compared.",
+               {"column_a": col_a, "column_b": col_b})
+        return
+
+    want_a = {str(m) for m in cfg.markets}
+    want_b = {str(m) for m in (cfg.markets_b or cfg.markets)}
+    have_a = sorted({str(v) for v in
+                     df_a.loc[df_a[col_a].astype(str).isin(want_a), col_a].unique()})
+    have_b = sorted({str(v) for v in
+                     df_b.loc[df_b[col_b].astype(str).isin(want_b), col_b].unique()})
+    detail = {"scope_a": sorted(want_a), "scope_b": sorted(want_b),
+              "present_a": have_a, "present_b": have_b,
+              "n_a": len(have_a), "n_b": len(have_b)}
+
+    if not have_b and have_a:
+        qc.add("market_scope", "Market scope", FAIL,
+               "The updated dataset holds no rows for any market in scope, so "
+               "every after-value in the block is missing.", detail)
+        return
+    if len(have_b) < len(have_a):
+        qc.add("market_scope", "Market scope", WARN,
+               f"The previous dataset covers {len(have_a)} market(s) in scope and "
+               f"the updated one {len(have_b)}, so {len(have_a) - len(have_b)} "
+               "market(s) have a before-value but no after-value to compare "
+               "against. Pair them in step 3 to bring them in.", detail)
+        return
+    qc.add("market_scope", "Market scope", PASS,
+           f"Both sides are scoped to the same {len(have_a)} market(s).", detail)
+
+
 def check_export_completeness(expected: Sequence[str], produced: dict,
                               qc: QCReport) -> None:
     """Every selected category must yield both an Excel and a PPTX."""
@@ -715,6 +774,7 @@ def run_qc(reports: Sequence[dict], cfg, df_a, df_b,
     """
     qc = QCReport()
     check_metric_wiring(cfg, df_a, df_b, qc)
+    check_market_scope(df_a, df_b, cfg, qc)
     check_missing_values(df_a, df_b, cfg, qc)
     check_duplicates(df_a, df_b, cfg, qc)
     check_mapping_coverage(mapping_results or {}, qc)

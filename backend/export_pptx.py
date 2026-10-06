@@ -97,6 +97,23 @@ def default_template_path() -> str:
     return exact
 
 
+def _measured_note(blk: dict) -> str:
+    """Which rows the figures were measured on - stated, not implied.
+
+    A stacked workbook carries the Total Market row *and* the channels it covers,
+    so "the category total" is ambiguous: the Total Market's own rows, or the sum
+    of everything in scope. The two differ by the channels the total already
+    contains (~1.48x on the reference file).
+    """
+    if blk.get("measured_on") == "total_market":
+        name = (blk.get("baseline") or {}).get("name")
+        return ("Measured on the Total Market"
+                + (f" · {name}" if name else "")
+                + " - the channels beneath it are not added to it again.")
+    return ("Measured as the sum of every market in scope, including any market "
+            "that is itself a total.")
+
+
 def _fmt(v, disp: dict) -> str:
     if v is None:
         return "-"
@@ -534,6 +551,9 @@ def _headline_slide(prs, blank, blk, cat, metric, mkt_label, disp, meta):
         _textbox(s, Inches(8.9), y1 + Inches(0.75), Inches(3.6), Inches(0.42),
                  _fmt(ac, disp), size=18, bold=True,
                  color=RED if (ac is not None and ac < 0) else INK)
+
+    _textbox(s, Inches(0.5), Inches(4.75), SW - Inches(1.0), Inches(0.3),
+             _measured_note(blk), size=9, color=MUTED)
 
 
 def _market_slides(prs, blank, blk, cat, metric, disp):

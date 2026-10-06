@@ -338,6 +338,20 @@ Share         = entity MAT TY / category MAT TY
 Contribution  = share of the category total, plus share of the total change
 ```
 
+### What the headline is measured on
+
+A stacked workbook carries the **Total Market row and the channel rows it
+covers**, so "the category total" is ambiguous. When a Total Market is
+designated, the headline, the Top-N, the client tracker and the contributors are
+all measured on **that market's rows** — summing every row in scope would add the
+channels to a total that already contains them (a factor of **1.48** on the
+reference workbook: 38.47Bn where the row read 25.96Bn).
+
+The market block still lists every market row, because that is its job. Both sides
+must have a Total Market row; if either lacks one, both fall back to the sum of
+the markets in scope and the run says so. Every report, workbook and deck states
+which convention produced its figures.
+
 ---
 
 ## Display units (step 5)

@@ -759,6 +759,7 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
     # That is the reason the pairing has two sides at all.
     scope = list(req.markets)
     scope_b: list[str] = []
+    scope_note = ""
     baseline_b = ""
     # The level of every *authored* pairing, by both the A and the B name. The
     # analysis splits its market presentation on this map (Total at the top, then
@@ -777,9 +778,28 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
         if not scope:
             scope, scope_b = MK.resolve_scope(mk, lvl)
         else:
-            # An explicit market list wins for A; the pairing still supplies B's
-            # counterpart names and the baseline's B-side name.
-            scope_b = mk.b_scope_for(lvl)
+            # Side B is the **counterpart** of side A: for each market the user
+            # selected on A, the B value they paired it with. Taking B from the
+            # level instead (`b_scope_for`) answers a different question - "which
+            # pairings are levelled Regions" - so a run whose A scope was the whole
+            # market and whose level was Regions read every A row and only the
+            # region's B rows. The before column was then the entire category and
+            # the after column a single market, and every other row in the block
+            # showed a dash where its after-value belongs.
+            scope_b = mk.b_counterparts(scope)
+            if not scope_b:
+                # No pairing at all for what was selected: fall back to the level
+                # rather than silently filtering B down to nothing.
+                scope_b = mk.b_scope_for(lvl)
+            loose = mk.unpaired(scope)
+            if loose:
+                scope_note = (
+                    f"{len(loose)} of the {len(scope)} markets in scope have no "
+                    f"counterpart in the updated dataset ({', '.join(loose[:4])}"
+                    f"{'…' if len(loose) > 4 else ''}), so those rows have no "
+                    "after-value to compare against. Pair them in step 3 to bring "
+                    "them in."
+                )
         base_name = (req.baseline_market or "").strip()
         if base_name:
             for p in mk.pairs:
@@ -864,6 +884,14 @@ def _build_prepared_for(req: RunRequest, metric: "MetricBlock | None") -> tuple[
         trend_b_metric=req.trend_metric_b,
     )
     prep = A.prepare(df_a, df_b, cfg)
+
+    # The market scope is the one thing the two sides must agree on: a before
+    # column drawn from a wider set of markets than the after column is not a
+    # before/after comparison, it is two different measurements. Side B is the
+    # counterpart of side A, and anything in scope with no counterpart is said
+    # out loud rather than showing as a dash in the block.
+    if scope_note:
+        prep.notes.append(scope_note)
 
     # Trend-grain frames, if supplied, are attached for the trend block
     ta = tb = None
@@ -1008,6 +1036,44 @@ def _apply_display(req, reports: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _note_measurement(reports: list[dict], prep) -> None:
+    """Record which rows the headline was measured on.
+
+    A stacked file carries the Total Market **and** the channels it covers, so
+    "the category total" is ambiguous: the Total Market's own rows, or the sum of
+    everything in scope. The two differ by the channels the total already contains
+    - a factor of 1.48 on the reference workbook - and a reader cannot tell which
+    produced the headline unless the run says.
+
+    Read from the reports rather than from the request, so the note describes what
+    actually happened: a Total Market can be named in step 3 and still be missing
+    from one side of the data, in which case the analysis falls back and says so.
+    """
+    if not reports:
+        return
+    on_total = [r for r in reports if r.get("measured_on") == "total_market"]
+    if on_total and len(on_total) == len(reports):
+        name = (on_total[0].get("baseline") or {}).get("name") or "the Total Market"
+        prep.notes.append(
+            f"The headline, the Top-N and the contributors are measured on the "
+            f"Total Market rows ({name}), not on every market in scope - a "
+            "stacked file's Total already contains the channels beneath it, so "
+            "summing them would count those channels twice."
+        )
+    elif not on_total:
+        prep.notes.append(
+            "No Total Market row was found on both sides, so the headline, the "
+            "Top-N and the contributors are the sum of every market in scope - "
+            "which includes any market that is itself a total."
+        )
+    else:
+        prep.notes.append(
+            f"{len(reports) - len(on_total)} of {len(reports)} categories have no "
+            "Total Market row on both sides; for those the headline is the sum of "
+            "every market in scope instead."
+        )
+
+
 def _run_reports(req: RunRequest):
     """Run the analysis for every selected metric and combine into one per category.
 
@@ -1024,6 +1090,7 @@ def _run_reports(req: RunRequest):
         if ta is not None and tb is not None:
             for rep in reports:
                 rep["trend"] = _trend_for(rep["category"], prep.cfg, ta, tb, req)
+        _note_measurement(reports, prep)
         _apply_display(req, reports)
         return prep, df_a, df_b, reports, {}
 
@@ -1063,6 +1130,10 @@ def _run_reports(req: RunRequest):
                 "is_rate_metric": rep.get("is_rate_metric", False),
                 "growth_applicable": rep.get("growth_applicable", True),
                 "total": rep["total"],
+                # Whether the headline is the Total Market's own rows or the sum
+                # of every market in scope. The two differ by the channels the
+                # total already contains, so a reader has to be able to tell.
+                "measured_on": rep.get("measured_on"),
                 "insights": rep.get("insights") or [],
                 "channel_block": rep.get("channel_block") or [],
                 "channel_level_block": (rep.get("blocks") or {}).get("channel"),
@@ -1078,6 +1149,7 @@ def _run_reports(req: RunRequest):
             }
 
     reports = [by_cat[c] for c in order if c in by_cat]
+    _note_measurement(reports, first)
     # The combined report keeps the FIRST metric as the headline (top-level
     # `total`, `insights`, `channel_block`...), so the existing renderers and the
     # exports keep working; the per-metric detail rides along in `metrics`.
@@ -1088,6 +1160,7 @@ def _run_reports(req: RunRequest):
             rep["metric_key"] = first_key
             rep["metric"] = head["label"]
             rep["total"] = head["total"]
+            rep["measured_on"] = head.get("measured_on")
             rep["insights"] = head["insights"]
             rep["channel_block"] = head["channel_block"]
             rep["channel_level_block"] = head.get("channel_level_block")
@@ -1153,6 +1226,9 @@ def _compact_report(rep: dict, top_n: int) -> dict:
         "metric_key": rep.get("metric_key"),
         "is_rate_metric": rep.get("is_rate_metric"),
         "growth_applicable": rep.get("growth_applicable", True),
+        # Which rows the headline came from, so the screen can say whether it is
+        # the Total Market or the sum of the markets in scope.
+        "measured_on": rep.get("measured_on"),
         "metrics": rep.get("metrics") or {},
         # How each metric's numbers are written (unit + decimals). Carried with
         # the report so the screen and the exports read the same figures.
