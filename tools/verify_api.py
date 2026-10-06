@@ -353,11 +353,19 @@ def main() -> int:
     ps = [f for f in exp["files"] if f["kind"] == "pptx"][:2]
     for f in xs:
         wb = openpyxl.load_workbook(os.path.join(OUTPUTS, f["rel"]))
-        check(f"xlsx opens: {os.path.basename(f['rel'])}", "Summary" in wb.sheetnames,
-              f"{len(wb.sheetnames)} sheets")
+        # No summary sheet and no QC sheet: both were removed on request, so the
+        # assertion is that a table sheet is present and neither of the removed
+        # ones is.
+        ok = (any(s.startswith(("Channel", "Manufacturer Top-N", "Brand Top-N"))
+                  for s in wb.sheetnames)
+              and "Summary" not in wb.sheetnames and "QC" not in wb.sheetnames)
+        check(f"xlsx opens with per-metric tables only: {os.path.basename(f['rel'])}",
+              ok, f"sheets={wb.sheetnames}")
     for f in ps:
         prs = Presentation(os.path.join(OUTPUTS, f["rel"]))
-        check(f"pptx opens: {os.path.basename(f['rel'])}", len(prs.slides) >= 7,
+        has_chart = any(sh.has_chart for sl in prs.slides for sh in sl.shapes)
+        check(f"pptx opens without a chart: {os.path.basename(f['rel'])}",
+              len(prs.slides) >= 3 and not has_chart,
               f"{len(prs.slides)} slides")
 
     # --- 8. download endpoint ----------------------------------------------

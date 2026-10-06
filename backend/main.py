@@ -553,6 +553,20 @@ class MetricBlock(BaseModel):
     weight_metric_b: str = ""
 
 
+class DisplaySpec(BaseModel):
+    """How a metric's numbers should be written.
+
+    ``unit`` is the user's choice in step 5 — ``auto`` (pick from the magnitude),
+    or an explicit ``ones`` / ``thousands`` / ``millions`` / ``billions`` — and
+    ``decimals`` the number of decimal places. It is carried into the report so
+    the on-screen analysis, the workbook and the deck all use the same unit;
+    without that they each scaled from their own slice of the data and the same
+    figure could be printed in millions on one sheet and billions on the next.
+    """
+    unit: str = "auto"
+    decimals: int = 2
+
+
 class RunRequest(BaseModel):
     a: DatasetSpec
     b: DatasetSpec
@@ -573,6 +587,9 @@ class RunRequest(BaseModel):
     # multi-metric form: when non-empty, one combined report per category carries
     # a block for every metric selected. Supersedes the single-metric fields.
     metrics: list[MetricBlock] = []
+    # Display units, keyed by metric key (`sales_value` / `volume` / `nd`). A
+    # metric with no entry is presented automatically.
+    display: dict[str, DisplaySpec] = {}
     # selections
     markets: list[str] = []
     categories: list[str] = []
@@ -937,6 +954,60 @@ def _mapping_results_from_request(req: "RunRequest") -> dict:
     return out
 
 
+def _apply_display(req, reports: list[dict]) -> dict[str, dict]:
+    """Stamp one display unit per metric onto every report in the run.
+
+    Resolved **once per metric for the whole run**, from the largest figure the
+    run carries, so every category of a bulk export is written in the same unit.
+    Scaling each sheet from its own slice would print the same kind of figure in
+    millions in one workbook and billions in the next, which is exactly what a
+    reader comparing two categories cannot afford.
+
+    An explicit choice in step 5 wins; `auto` falls back to the magnitude. A rate
+    metric is a percentage and is never scaled.
+    """
+    keys: list[str] = []
+    for rep in reports:
+        for k in (rep.get("metrics") or {}):
+            if k not in keys:
+                keys.append(k)
+    if not keys:
+        keys = [""]
+
+    out: dict[str, dict] = {}
+    for k in keys:
+        spec = (req.display or {}).get(k)
+        is_rate = False
+        mx = 0.0
+        for rep in reports:
+            blk = (rep.get("metrics") or {}).get(k)
+            if blk is not None:
+                is_rate = is_rate or bool(blk.get("is_rate_metric"))
+            else:
+                blk = rep
+                is_rate = is_rate or bool(rep.get("is_rate_metric"))
+            for f in ("before_prior", "before_current", "after_prior",
+                      "after_current", "abs_change"):
+                v = (blk.get("total") or {}).get(f)
+                if v is not None:
+                    try:
+                        mx = max(mx, abs(float(v)))
+                    except Exception:
+                        pass
+        out[k] = A.resolve_display(
+            getattr(spec, "unit", "auto") if spec else "auto",
+            getattr(spec, "decimals", 2) if spec else 2,
+            is_rate, mx)
+
+    for rep in reports:
+        for k, blk in (rep.get("metrics") or {}).items():
+            blk["display"] = out.get(k)
+        head = next(iter(rep.get("metrics") or {}), None)
+        rep["displays"] = dict(out)
+        rep["display"] = out.get(head) if head is not None else out.get("")
+    return out
+
+
 def _run_reports(req: RunRequest):
     """Run the analysis for every selected metric and combine into one per category.
 
@@ -953,6 +1024,7 @@ def _run_reports(req: RunRequest):
         if ta is not None and tb is not None:
             for rep in reports:
                 rep["trend"] = _trend_for(rep["category"], prep.cfg, ta, tb, req)
+        _apply_display(req, reports)
         return prep, df_a, df_b, reports, {}
 
     per_metric: list[tuple[A.Prepared, list[dict]]] = []
@@ -1033,6 +1105,7 @@ def _run_reports(req: RunRequest):
     if ta is not None and tb is not None:
         for rep in reports:
             rep["trend"] = _trend_for(rep["category"], first.cfg, ta, tb, req)
+    _apply_display(req, reports)
     return first, df_a, df_b, reports, cfgs_by_metric
 
 
@@ -1081,6 +1154,10 @@ def _compact_report(rep: dict, top_n: int) -> dict:
         "is_rate_metric": rep.get("is_rate_metric"),
         "growth_applicable": rep.get("growth_applicable", True),
         "metrics": rep.get("metrics") or {},
+        # How each metric's numbers are written (unit + decimals). Carried with
+        # the report so the screen and the exports read the same figures.
+        "display": rep.get("display"),
+        "displays": rep.get("displays") or {},
         "markets": rep.get("markets"),
         "total": rep["total"],
         "insights": rep.get("insights") or [],
@@ -1149,6 +1226,9 @@ class ExportRequest(RunRequest):
     run_name: str = "impact_run"
     include_excel: bool = True
     include_pptx: bool = True
+    # Optional override for the PowerPoint template. Blank means the repository
+    # default, `templates/impact_template.pptx`.
+    template_path: str = ""
 
 
 @app.post("/api/export")
@@ -1184,9 +1264,11 @@ def export(req: ExportRequest):
         "baseline_verified": bool(prep.baseline_verified),
         "baseline_before": prep.baseline_total[0],
         "baseline_after": prep.baseline_total[1],
-        # What the run did to the data, carried into the deliverables' QC sheet
-        # and the run index. A report that covers a subset of the rows should say
-        # so itself - the reader of the workbook does not see the app.
+        # What the run did to the data, carried into the run index. The QC sheet
+        # that used to carry them was removed from the deliverables on request;
+        # this record is a statement of scope, not a check, so it stays. A report
+        # that covers a subset of the rows should say so itself - the reader of
+        # the workbook does not see the app.
         "run_notes": [n for n in (prep.notes or []) if n],
     }
 
@@ -1203,7 +1285,8 @@ def export(req: ExportRequest):
             entry["excel"] = p
         if req.include_pptx:
             p = os.path.join(cat_dir, f"{base}_Impact.pptx")
-            export_pptx.build_category_deck(rep, qc_global.to_dict(), p, meta)
+            export_pptx.build_category_deck(rep, qc_global.to_dict(), p, meta,
+                                            template=req.template_path or None)
             entry["pptx"] = p
         produced[cat] = entry
         for kind, path in entry.items():
@@ -1217,9 +1300,19 @@ def export(req: ExportRequest):
                          cfgs_by_metric=cfgs_by_metric,
                          category_mapping=req.category_mapping)
 
-    # run-level index workbook
-    index_path = os.path.join(run_dir, "00_QC_and_Index.xlsx")
-    _write_index(index_path, reports, qc_final.to_dict(), req.run_name, meta)
+    # Run-level index: a list of what was produced, and nothing else.
+    #
+    # The category summary and the QC sheet that used to live here were both
+    # removed on request. The summary restated figures every per-category workbook
+    # already carries, and the validation belongs to the app that ran it rather
+    # than to the folder the client receives.
+    index_path = os.path.join(run_dir, "00_Index.xlsx")
+    # `req.metrics` holds MetricBlock models, not dicts - reading them with
+    # `.get()` raised AttributeError on a bare 500 at the very end of a run,
+    # after every file had been written.
+    metric_labels = [m.label or m.key for m in (req.metrics or [])] \
+        or ([cfg.metric_label] if cfg.metric_label else [])
+    _write_index(index_path, req.run_name, meta, files, metric_labels)
     files.append({"category": "(run)", "kind": "index", "path": index_path,
                   "rel": os.path.relpath(index_path, OUTPUTS).replace("\\", "/"),
                   "size": os.path.getsize(index_path)})
@@ -1243,8 +1336,15 @@ def export(req: ExportRequest):
     }
 
 
-def _write_index(path: str, reports: list[dict], qc: dict, run_name: str,
-                 meta: dict | None = None):
+def _write_index(path: str, run_name: str, meta: dict | None,
+                 files: list[dict], metrics: list[str]):
+    """The run index: what was produced, as one flat table.
+
+    Nothing else. The category summary and the QC sheet that used to sit beside
+    it were removed on request - the summary restated figures every per-category
+    workbook already carries, and the validation belongs to the app that ran it,
+    not to the folder the client receives.
+    """
     import xlsxwriter
 
     meta = meta or {}
@@ -1260,76 +1360,51 @@ def _write_index(path: str, reports: list[dict], qc: dict, run_name: str,
     fl = wb.add_format({"border": 1, "border_color": "#BFBFBF"})
     fn = wb.add_format({"border": 1, "border_color": "#BFBFBF",
                         "num_format": "#,##0"})
-    fp = wb.add_format({"border": 1, "border_color": "#BFBFBF",
-                        "num_format": '+0.0"%";-0.0"%";0.0"%"'})
     ft = wb.add_format({"bold": True, "font_size": 14})
 
-    ws = wb.add_worksheet("Category Summary")
+    ws = wb.add_worksheet("Index")
     ws.set_column("A:A", 34)
-    ws.set_column("B:I", 18)
+    ws.set_column("B:B", 12)
+    ws.set_column("C:C", 30)
+    ws.set_column("D:D", 46)
+    ws.set_column("E:E", 12)
+
     ws.write(0, 0, meta.get("impact_name") or f"Impact study - {run_name}", ft)
     bits: list[str] = []
     if meta.get("client_name"):
         bits.append(f"Client: {meta['client_name']}")
-    bits.append(f"{len(reports)} categories")
-    bits.append(f"QC: {qc.get('worst')}")
+    if metrics:
+        bits.append("Metrics: " + ", ".join(metrics))
+    bits.append(f"{len([f for f in files if f.get('kind') != 'index'])} file(s)")
     if meta.get("baseline_market"):
         bits.append(f"shares measured against {meta['baseline_market']}")
     ws.write(1, 0, "  |  ".join(bits), fl)
-    heads = ["Category", "Metric", "BEFORE MAT YA", "BEFORE MAT TY",
-             "AFTER MAT YA", "AFTER MAT TY", "Abs change", "Level shift (pp)",
-             "Contribution vs Total Market (%)"]
-    for i, h in enumerate(heads):
+
+    for i, h in enumerate(["Category", "Kind", "File", "Relative path", "Size (KB)"]):
         ws.write(3, i, h, fh)
-    fp_note = fp
     r = 4
-    for rep in reports:
-        # One row per metric. A run may carry Sales Value, Volume and ND
-        # together, and each has its own total; a single row per category would
-        # silently show only the first metric's numbers.
-        blocks = rep.get("metrics") or {"": rep}
-        for key, blk in blocks.items():
-            t = blk.get("total") or {}
-            ws.write(r, 0, rep["category"], fl)
-            ws.write(r, 1, blk.get("label") or rep.get("metric") or key, fl)
-            for c, k in ((2, "before_prior"), (3, "before_current"),
-                         (4, "after_prior"), (5, "after_current")):
-                if t.get(k) is not None:
-                    ws.write_number(r, c, t[k], fn)
-            if t.get("abs_change") is not None:
-                ws.write_number(r, 6, t["abs_change"], fn)
-            if t.get("level_shift_pp") is not None:
-                ws.write_number(r, 7, t["level_shift_pp"], fp_note)
-            ins = {i.get("key"): i for i in (blk.get("insights") or [])}
-            share = (ins.get("contribution") or {}).get("after_share_pct")
-            if share is not None:
-                ws.write_number(r, 8, share, fp_note)
-            r += 1
+    for f in files:
+        if f.get("kind") == "index":
+            continue
+        ws.write(r, 0, f.get("category", ""), fl)
+        ws.write(r, 1, f.get("kind", ""), fl)
+        ws.write(r, 2, os.path.basename(f.get("path", "")), fl)
+        ws.write(r, 3, f.get("rel", ""), fl)
+        ws.write_number(r, 4, round((f.get("size") or 0) / 1024), fn)
+        r += 1
     ws.freeze_panes(4, 1)
 
-    ws2 = wb.add_worksheet("QC")
-    ws2.set_column("A:A", 26)
-    ws2.set_column("B:B", 9)
-    ws2.set_column("C:C", 72)
-    ws2.write(0, 0, f"Automated QC - {qc.get('worst')}", ft)
-    for i, h in enumerate(["Check", "Status", "Message"]):
-        ws2.write(2, i, h, fh)
-    checks = qc.get("checks", [])
-    for r, c in enumerate(checks, start=3):
-        ws2.write(r, 0, c["name"], fl)
-        ws2.write(r, 1, c["status"], fl)
-        ws2.write(r, 2, c["message"], fl)
-    # What the run did to the data, below the checks and not counted among them -
-    # chiefly how much of it is in scope. The deliverable should say so itself,
-    # rather than only the app that produced it.
+    # What the run did to the data - chiefly how much of it is in scope. Not a
+    # QC result and not counted as one, but a report that covers a subset of the
+    # rows has to say so itself: the reader of the folder does not see the app.
     notes = [n for n in (meta.get("run_notes") or []) if n]
     if notes:
-        r = 3 + len(checks) + 1
-        ws2.write(r, 0, "Run notes", fh)
+        r += 1
+        ws.write(r, 0, "Run notes", fh)
         for n in notes:
             r += 1
-            ws2.write(r, 1, "•", fl)
-            ws2.write(r, 2, n, fl)
+            ws.write(r, 0, "•", fl)
+            ws.write(r, 1, n, fl)
     wb.close()
 
 
@@ -1393,6 +1468,28 @@ def health():
 
 if os.path.isdir(FRONTEND):
     app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
+
+    @app.middleware("http")
+    async def _no_store_frontend(request, call_next):
+        """Never let the browser serve the app itself from cache.
+
+        `StaticFiles` sends `etag`/`last-modified` but no `Cache-Control`, so a
+        browser is free to reuse `app.js` under its own heuristic freshness rule.
+        The result is a page whose HTML is current and whose JavaScript is not -
+        a new control that renders as an empty box, with nothing in the console
+        to explain it. That is a five-minute mystery every time the frontend
+        changes, and it already cost one debugging round when a probe was reading
+        a cached asset.
+
+        Scoped to the shell and `/static/` only: the API responses and the
+        workbooks are untouched, and `no-cache` still allows a conditional
+        request, so the 116 KB script is a 304 when it has not changed.
+        """
+        resp = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            resp.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return resp
 
     @app.get("/__workbook/{name}")
     def serve_workbook(name: str):

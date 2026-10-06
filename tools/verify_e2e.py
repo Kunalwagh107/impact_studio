@@ -337,44 +337,95 @@ def part1() -> None:
     # verify the produced artefacts actually open and contain what they claim
     import openpyxl
     from pptx import Presentation
+    from pptx.oxml.ns import qn
 
     xp = files[0]
     wb = openpyxl.load_workbook(xp)
-    # Brand Value Share was removed on request, so it must be absent - and the
-    # assertion is written to fail if it ever comes back, not merely to skip it.
-    expected_sheets = {"Summary", "Channel Block",
-                       "Manufacturer Top-N", "Brand Top-N", "Client Brands",
-                       "Contributors", "QC"}
     got_sheets = set(wb.sheetnames)
-    check("Excel contains every expected sheet", expected_sheets <= got_sheets,
-          f"missing {expected_sheets - got_sheets}" if expected_sheets - got_sheets
-          else f"{len(got_sheets)} sheets")
+
+    # The summary sheet and the QC sheet were both removed on request, and the
+    # tables are now emitted **per metric**. The assertions are written to fail if
+    # either removal is undone, not merely to skip the missing name.
+    check("Excel has no summary sheet", "Summary" not in got_sheets,
+          f"sheets={sorted(got_sheets)}")
+    check("Excel has no QC sheet", "QC" not in got_sheets,
+          f"sheets={sorted(got_sheets)}")
+    check("Excel carries a market/channel table",
+          any(s.startswith("Channel") for s in got_sheets),
+          f"sheets={sorted(got_sheets)}")
+    check("Excel carries a Manufacturer Top-N and a Brand Top-N",
+          any(s.startswith("Manufacturer Top-N") for s in got_sheets)
+          and any(s.startswith("Brand Top-N") for s in got_sheets),
+          f"sheets={sorted(got_sheets)}")
     check("Excel does not contain the removed Brand Value Share sheet",
           "Brand Value Share" not in got_sheets,
           f"sheets={sorted(got_sheets)}")
 
-    # the Excel must agree with the report it was built from
-    ws = wb["Summary"]
-    found = None
-    for row in ws.iter_rows(values_only=True):
-        if row and row[0] == "Current period (MAT TY)":
-            found = row
-            break
-    rep0 = reports[0]
-    scale = 1e9 if abs(rep0["total"]["before_current"] or 0) >= 1e9 else 1.0
-    ok = (found is not None
-          and abs((found[1] or 0) * scale - rep0["total"]["before_current"]) < 1)
-    check("Excel Summary matches the analysis object", ok,
-          f"cell={found[1] if found else None} vs {rep0['total']['before_current']}")
+    # "Proper tabular format" means one header row, one record per row, and no
+    # merged cells - a merged banner is what stops a reader filtering the table.
+    ch_name = next(s for s in got_sheets if s.startswith("Channel"))
+    ws = wb[ch_name]
+    rows = list(ws.iter_rows(values_only=True))
+    hdr = next((r for r in rows if r and r[0] == "Entity"), None)
+    check("channel table has a single flat header row",
+          hdr is not None and "Level" in hdr and hdr.count("Entity") == 1,
+          f"header={hdr}")
+    check("channel table has no merged cells",
+          len(ws.merged_cells.ranges) == 0,
+          f"{len(ws.merged_cells.ranges)} merged range(s)")
+    data_rows = [r for r in rows if r and r[0] and r[0] != "Entity"
+                 and not str(r[0]).startswith(("Market /", "Category:", "Values are",
+                                               "Share is", "Growth =", "This metric",
+                                               "Distribution", "The Total"))]
+    check("channel table has one record per entity", len(data_rows) >= 1,
+          f"{len(data_rows)} data row(s)")
+
+    # The workbook must write the figures in the unit the run resolved, not in a
+    # scale of its own choosing.
+    disp = (reports[0].get("metrics") or {}).get(
+        next(iter(reports[0].get("metrics") or {}), ""), reports[0]).get("display")
+    if disp:
+        sym = disp.get("symbol") or ""
+        check("Excel writes the metric's resolved unit in its title",
+              sym in (rows[0][0] if rows and rows[0] else ""),
+              f"title={rows[0][0] if rows else None} symbol={sym!r}")
 
     prs = Presentation(files[1])
     n_slides = len(prs.slides)
-    check("PowerPoint has the expected slide count", n_slides >= 7,
-          f"{n_slides} slides")
-    has_chart = any(sh.has_chart for sl in prs.slides for sh in sl.shapes)
-    check("PowerPoint contains native charts", has_chart)
-    has_table = any(sh.has_table for sl in prs.slides for sh in sl.shapes)
-    check("PowerPoint contains tables", has_table)
+    check("PowerPoint has slides", n_slides >= 3, f"{n_slides} slides")
+    check("PowerPoint has no chart (charts removed on request)",
+          not any(sh.has_chart for sl in prs.slides for sh in sl.shapes))
+    check("PowerPoint contains tables",
+          any(sh.has_table for sl in prs.slides for sh in sl.shapes))
+    first_text = [sh.text_frame.text for sh in prs.slides[0].shapes
+                  if sh.has_text_frame and sh.text_frame.text.strip()]
+    check("PowerPoint has no cover slide - it opens on the impact headline",
+          bool(first_text) and first_text[0].lower().startswith("headline impact"),
+          f"first slide reads {first_text[0] if first_text else None!r}")
+    titles = [sh.text_frame.text for sl in prs.slides for sh in sl.shapes
+              if sh.has_text_frame and sh.text_frame.text.strip()]
+    check("PowerPoint has a Top-N manufacturers section and a Top-N brands section",
+          any(t.lower().startswith("top") and "manufacturer" in t.lower() for t in titles)
+          and any(t.lower().startswith("top") and "brand" in t.lower() for t in titles))
+    check("PowerPoint has no QC slide",
+          not any("automated qc" in t.lower() for t in titles))
+
+    # Every table cell must carry a black border on all four sides.
+    bordered = 0
+    checked_cells = 0
+    for sl in prs.slides:
+        for sh in sl.shapes:
+            if not sh.has_table:
+                continue
+            tc = sh.table.cell(0, 0)._tc
+            tcPr = tc.find(qn('a:tcPr'))
+            checked_cells += 1
+            if tcPr is not None and all(tcPr.find(qn(f'a:ln{s}')) is not None
+                                        for s in ("L", "R", "T", "B")):
+                bordered += 1
+    check("every table has black borders on all four sides",
+          checked_cells > 0 and bordered == checked_cells,
+          f"{bordered}/{checked_cells} tables bordered")
 
     print(f"\n      outputs written under {OUT}")
 
@@ -2109,14 +2160,33 @@ def part10() -> None:
         export_pptx.build_category_deck(rep, qc.to_dict(), pp)
         return rep, xp, pp
 
+    def channel_sheet(path: str):
+        """The channel table, plus where its BEFORE MAT TY column sits.
+
+        The columns are located from the header row rather than hard-coded: the
+        table is per metric now and the column count differs between a growth
+        metric and a distribution level.
+        """
+        wb = openpyxl.load_workbook(path)
+        name = next(s for s in wb.sheetnames if s.startswith("Channel"))
+        ws = wb[name]
+        all_rows = [r for r in ws.iter_rows(values_only=True) if r and r[0]]
+        hdr = next((r for r in all_rows if r[0] == "Entity"), None)
+        return ws, all_rows, hdr
+
+    def disp_scale(rep: dict) -> float:
+        """The scale the exporter used - read from the report, not guessed."""
+        blk = (rep.get("metrics") or {}).get(
+            next(iter(rep.get("metrics") or {}), ""), rep)
+        return (blk.get("display") or {}).get("scale") or 1.0
+
     # --- with a Total Market designated ------------------------------------
     rep, xp, pp = run("TOTAL", "p10_with_baseline")
     check("the report knows the Total Market baseline",
           (rep.get("baseline") or {}).get("name") == "TOTAL",
           f"baseline={(rep.get('baseline') or {}).get('name')!r}")
 
-    ws = openpyxl.load_workbook(xp)["Channel Block"]
-    rows = [r for r in ws.iter_rows(values_only=True) if r and r[0]]
+    ws, rows, hdr = channel_sheet(xp)
     labels = [r[0] for r in rows]
     head = next((r for r in rows
                  if isinstance(r[0], str) and r[0].startswith("Total Market")), None)
@@ -2131,17 +2201,15 @@ def part10() -> None:
     if head is not None:
         # The head value must be the baseline itself, not the wider category sum.
         # The writer scales its figures, so re-derive the same scale from the
-        # report's own magnitudes rather than guessing from the cell value.
-        cb = rep["channel_block"]
-        _scale, _unit = export_excel._scale_of(
-            *[b["after"]["mat_ty"] for b in cb],
-            *[b["before"]["mat_ty"] for b in cb])
-        head_v = (head[2] or 0.0) * (_scale or 1.0)
+        # report's own display block rather than guessing from the cell value.
+        col = hdr.index("BEFORE MAT TY")
+        scale = disp_scale(rep)
+        head_v = (head[col] or 0.0) * scale
         base_v = rep["baseline"]["before"]
         total_v = rep["total"]["before_current"]
         check("the head row equals the Total Market, not the category sum",
               base_v is not None and abs(head_v - base_v) <= max(abs(base_v), 1) * 1e-6,
-              f"cell={head[2]}x{_scale or 1} = {head_v} baseline={base_v} "
+              f"cell={head[col]}x{scale} = {head_v} baseline={base_v} "
               f"category_sum={total_v}")
         # And the sum must genuinely differ, or the check above proves nothing.
         check("the category sum really is wider than the Total Market",
@@ -2155,46 +2223,554 @@ def part10() -> None:
             if not sh.has_table:
                 continue
             hdr = [c.text for c in sh.table.rows[0].cells]
-            if hdr and hdr[0] in ("Channel", "Top channel (by TY)"):
+            # The market table's first column is headed by the level's noun, so a
+            # region block reads "Regions". Matching only the old "Channel" label
+            # made this read as a deck with no market table at all.
+            if hdr and hdr[0] in ("Channel", "Channels", "Region", "Regions",
+                                  "Market", "Markets", "Top channel (by TY)"):
                 ls_tables.append(sh.table)
     check("the deck has a channel/level-shift table to inspect",
           len(ls_tables) >= 1, f"{len(ls_tables)} table(s)")
     deck_first = [t.rows[1].cells[0].text.strip() for t in ls_tables if len(t.rows) > 1]
     # python-pptx rows do not accept negative indices.
     deck_last = [t.rows[len(t.rows) - 1].cells[0].text.strip() for t in ls_tables]
-    # The deck writes the market name verbatim (the Excel decorates it as
-    # "Total Market · X"), so match against the baseline name itself.
+    # The deck decorates the total row the same way the workbook does, so the
+    # leading row of a market table reads as the Total Market rather than as one
+    # more channel that happens to be highlighted.
     base_label = (rep.get("baseline") or {}).get("name") or ""
     check("the deck leads its table with the Total Market",
-          bool(base_label) and any(t == base_label for t in deck_first),
+          bool(base_label) and any(
+              t in (base_label, "Total Market · " + base_label) for t in deck_first),
           f"baseline={base_label!r} first rows={deck_first}")
     check("the deck appends no second Total row",
           not [t for t in deck_last if t == "Total"],
           f"last rows={deck_last}")
 
     # --- with no Total Market designated ------------------------------------
+    #
+    # The foot row is a fallback for a block that carries **no total at all**.
+    # Naming no baseline is not enough on its own: this fixture still lists a
+    # market levelled `total`, and that row already *is* the total - appending a
+    # sum beneath it is the duplication the user reported ("we already have total
+    # market selected"). So the case that must keep the row is a block whose
+    # markets are all channels and regions.
     rep2, xp2, _ = run("", "p10_no_baseline")
     check("with no baseline the report says so",
           not (rep2.get("baseline") or {}).get("name"),
           f"baseline={(rep2.get('baseline') or {}).get('name')!r}")
-    ws2 = openpyxl.load_workbook(xp2)["Channel Block"]
-    rows2 = [r for r in ws2.iter_rows(values_only=True) if r and r[0]]
+    ws2, rows2, hdr2 = channel_sheet(xp2)
     sums = [r[0] for r in rows2
             if isinstance(r[0], str) and r[0].strip().startswith("Total (")]
-    check("with no Total Market the foot row survives, labelled as a sum",
-          len(sums) == 1, f"sum rows={sums}")
+    check("a block that already carries a levelled Total gets no second sum row",
+          not sums, f"sum rows={sums}")
+    check("...and that total row is labelled as the Total Market",
+          any(str(r[0]).startswith("Total Market · ")
+              for r in rows2 if r and r[0]),
+          f"{[r[0] for r in rows2 if r and r[0]][:6]}")
+
+    # A block with no total anywhere: the sum is the only aggregate there is.
+    df3 = pd.DataFrame({
+        "CATEGORY": ["C1"] * 3,
+        "MKT": ["CH-A", "CH-B", "RG-N"],
+        "Sales Value YA": [27.0, 18.0, 20.0],
+        "Sales Value": [30.0, 20.0, 24.0],
+    })
+    cfg3 = A.AnalysisConfig(
+        a_prior="Sales Value YA", a_current="Sales Value",
+        b_prior="Sales Value YA", b_current="Sales Value",
+        category_col="CATEGORY", market_col="MKT",
+        markets=["CH-A", "CH-B", "RG-N"],
+        market_levels={"CH-A": "channel", "CH-B": "channel", "RG-N": "region"},
+    )
+    rep3 = A.category_report(A.prepare(df3, df3, cfg3), "C1")
+    d3 = os.path.join(OUT, "p10_no_total_at_all")
+    os.makedirs(d3, exist_ok=True)
+    xp3 = os.path.join(d3, "C1_Impact.xlsx")
+    export_excel.build_category_workbook(rep3, {}, xp3)
+    _ws3, rows3, hdr3 = channel_sheet(xp3)
+    sums3 = [r[0] for r in rows3
+             if isinstance(r[0], str) and r[0].strip().startswith("Total (")]
+    check("with no total anywhere the foot row survives, labelled as a sum",
+          len(sums3) == 1, f"sum rows={sums3}")
     # And it must be the sum the report computed - the only aggregate available.
-    if len(sums) == 1:
-        cell = next(r for r in rows2 if r[0] == sums[0])
-        cb2 = rep2["channel_block"]
-        _s2, _u2 = export_excel._scale_of(
-            *[b["after"]["mat_ty"] for b in cb2],
-            *[b["before"]["mat_ty"] for b in cb2])
-        v = (cell[2] or 0.0) * (_s2 or 1.0)
-        want = rep2["total"]["before_current"]
+    if len(sums3) == 1:
+        cell = next(r for r in rows3 if r[0] == sums3[0])
+        scale3 = disp_scale(rep3)
+        v = (cell[hdr3.index("BEFORE MAT TY")] or 0.0) * scale3
+        want = rep3["total"]["before_current"]
         check("the foot row carries the category sum",
               want is not None and abs(v - want) <= max(abs(want), 1) * 1e-6,
-              f"cell={cell[2]}x{_s2 or 1} = {v} report_total={want}")
+              f"cell={cell[hdr3.index('BEFORE MAT TY')]}x{scale3} = {v} "
+              f"report_total={want}")
+
+
+# ===========================================================================
+# PART 14 - display units, per-metric tables, and a symmetric Gain / Loss
+#
+# Three things the user reported or asked for:
+#
+#   * "For Gain, I am not seeing any values." The contributor block sorted on
+#     `abs_change` and took the tail, and pandas sorts an uncomputable value last
+#     - so "Gainers" selected exactly the entities whose change was unknown and
+#     printed names with no figures. Both halves are now drawn from rows that
+#     carry a change, and each is bounded by zero, so a fall is never shown under
+#     "Gain" either.
+#   * A unit and decimal count chosen in step 5, honoured on screen and in both
+#     exports.
+#   * One table per metric in the exports, and no contribution columns for a
+#     distribution level.
+# ===========================================================================
+
+
+def _multi_metric_report() -> dict:
+    """A three-metric report, enough to exercise the exporters' per-metric paths."""
+    def side(a, b, gp):
+        return {"mat_ya": a, "mat_ty": b,
+                "growth_pct": ((b / a - 1) * 100) if (gp and a) else None}
+
+    def channel(name, level, ya, ty, ya2, ty2, gp):
+        return {
+            "name": name, "level": level,
+            "before": side(ya, ty, gp), "after": side(ya2, ty2, gp),
+            "level_shift": {"mat_ty_pp": 1.0, "before_share_pct": 60.0,
+                            "after_share_pct": 58.0},
+            "contribution": {"before_share_pct": 60.0, "after_share_pct": 58.0,
+                             "of_change_pct": 12.5},
+            "abs_change": ty2 - ty,
+        }
+
+    def topn(prefix):
+        return [{"name": f"{prefix}{i}", "before_prior": 1e9 - i * 1e7,
+                 "before_current": 1.1e9 - i * 1e7, "after_prior": 1.2e9 - i * 1e7,
+                 "after_current": 1.25e9 - i * 1e7, "share_change_pp": 0.3,
+                 "rank_before": i + 1, "rank_after": i + 1, "rank_change": 0,
+                 "movement": "HELD"} for i in range(10)]
+
+    def block(key, label, is_rate, gp, scale, symbol, decimals):
+        return {
+            "key": key, "label": label, "is_rate_metric": is_rate,
+            "growth_applicable": gp,
+            "display": {"unit": "auto", "scale": scale, "symbol": symbol,
+                        "decimals": decimals},
+            "total": {"before_prior": 3.85e10, "before_current": 3.846e10,
+                      "after_prior": 3.92e10, "after_current": 3.88e10,
+                      "abs_change": 3.3e8, "level_shift_pp": -0.9,
+                      "before_growth_pct": -0.2, "after_growth_pct": -1.1,
+                      "rows_before": 699, "rows_after": 701},
+            "insights": [], "baseline": {"name": "TW Total TW Offline (G)"},
+            "channel_block": [
+                channel("TW Total TW Offline (G)", "total", 2.6e10, 2.6e10,
+                        2.6e10, 2.61e10, gp),
+                channel("TW CVS", "channel", 8.7e9, 8.7e9, 9.0e9, 9.35e9, gp),
+            ],
+            "manufacturer_top_n": topn("MFR"), "brand_top_n": topn("BRD"),
+            "client_brands": [], "client_manufacturers": [],
+            "contributors": [],
+        }
+
+    return {
+        "category": "BEER", "metric": "Sales Value", "metric_key": "sales_value",
+        "markets": ["TW Total TW Offline (G)"],
+        "baseline": {"name": "TW Total TW Offline (G)"},
+        "display": {"unit": "auto", "scale": 1e9, "symbol": "Bn", "decimals": 2},
+        "metrics": {
+            "sales_value": block("sales_value", "Sales Value", False, True, 1e9, "Bn", 2),
+            "volume": block("volume", "Sales Volume", False, True, 1e6, "M", 1),
+            "nd": block("nd", "Numeric Distribution (ND)", True, False, 1.0, "", 0),
+        },
+    }
+
+
+def part14() -> None:
+    banner("PART 14  display units, per-metric tables, symmetric Gain / Loss")
+
+    import openpyxl
+    from pptx import Presentation
+
+    # --- A. Gain and Loss are the two halves of one comparison --------------
+    df_a = pd.DataFrame({
+        "CATEGORY": ["C1"] * 3,
+        "MKT": ["TOTAL"] * 3,
+        "MANUFACTURER": ["A", "B", "C"],
+        "BRAND": ["A", "B", "C"],
+        "Sales Value YA": [110.0, 100.0, 90.0],
+        "Sales Value": [100.0, 90.0, 80.0],
+    })
+    # Five manufacturers exist only in the updated dataset, and three that exist
+    # in both all fell. That is the shape that produced the bug: fewer than five
+    # measurable declines, and more than five uncomputable changes.
+    new_names = ["N1", "N2", "N3", "N4", "N5"]
+    df_b = pd.DataFrame({
+        "CATEGORY": ["C1"] * 8,
+        "MKT": ["TOTAL"] * 8,
+        "MANUFACTURER": ["A", "B", "C"] + new_names,
+        "BRAND": ["A", "B", "C"] + new_names,
+        "Sales Value YA": [105.0, 95.0, 85.0] + [np.nan] * 5,
+        "Sales Value": [90.0, 80.0, 70.0, 500.0, 400.0, 300.0, 200.0, 100.0],
+    })
+    cfg = A.AnalysisConfig(
+        metric_label="Sales Value", metric_key="sales_value",
+        a_prior="Sales Value YA", a_current="Sales Value",
+        b_prior="Sales Value YA", b_current="Sales Value",
+        category_col="CATEGORY", market_col="MKT",
+        manufacturer_col="MANUFACTURER", brand_col="BRAND",
+        markets=["TOTAL"], categories=["C1"],
+        baseline_market="TOTAL", market_levels={"TOTAL": "total"}, top_n=10,
+    )
+    rep = A.category_report(A.prepare(df_a, df_b, cfg), "C1")
+    man = next(c for c in rep["contributors"] if c["level"] == "manufacturer")
+    gainers, losers = man["gainers"], man["losers"]
+
+    check("the Gain list is populated", len(gainers) == 5, f"{len(gainers)} gainer(s)")
+    check("every Gain row carries an absolute change",
+          all(g["abs_change"] is not None for g in gainers),
+          f"{[g['abs_change'] for g in gainers]}")
+    check("every Gain row carries a contribution",
+          all(g["contribution_to_change_pct"] is not None for g in gainers),
+          f"{[g['contribution_to_change_pct'] for g in gainers]}")
+    check("Gain is never a fall", all(g["abs_change"] > 0 for g in gainers),
+          f"{[(g['name'], g['abs_change']) for g in gainers]}")
+    check("Loss is never a rise", all(l["abs_change"] < 0 for l in losers),
+          f"{[(l['name'], l['abs_change']) for l in losers]}")
+    check("every Loss row carries a value too",
+          all(l["abs_change"] is not None for l in losers),
+          f"{[l['abs_change'] for l in losers]}")
+    check("Gain is the largest rise first", [g["name"] for g in gainers] == new_names,
+          f"{[g['name'] for g in gainers]}")
+    check("Loss is the largest fall first", [l["name"] for l in losers] == ["A", "B", "C"],
+          f"{[l['name'] for l in losers]}")
+
+    # A missing side is zero, not unknown - the same convention the category total
+    # already uses. This is what makes the contributions reconcile with the change
+    # the headline reports: sum(delta) == tot_b - tot_a, here 1740 - 270 = 1470.
+    d_tot = rep["total"]["after_current"] - rep["total"]["before_current"]
+    check("an entity new in the updated dataset is a real rise, not an unknown",
+          gainers[0]["name"] == "N1" and abs(gainers[0]["abs_change"] - 500.0) < 1e-6,
+          f"{gainers[0]['name']}={gainers[0]['abs_change']}")
+    check("the contributor contributions are shares of the real category change",
+          abs(gainers[0]["contribution_to_change_pct"] - 500.0 / d_tot * 100) < 1e-6,
+          f"{gainers[0]['contribution_to_change_pct']} vs {500.0 / d_tot * 100}")
+
+    # --- B. display units ---------------------------------------------------
+    check("an explicit unit is honoured, not overridden by the magnitude",
+          A.resolve_display("millions", 2, False, 2.6e10)["scale"] == 1e6,
+          str(A.resolve_display("millions", 2, False, 2.6e10)))
+    check("auto picks the unit from the magnitude",
+          A.resolve_display("auto", 2, False, 2.5e6)["symbol"] == "M"
+          and A.resolve_display("auto", 2, False, 2.5e9)["symbol"] == "Bn")
+    check("the decimal count is carried",
+          A.resolve_display("billions", 1, False, 1e9)["decimals"] == 1)
+    check("a nonsensical decimal count is clamped, not passed through",
+          A.resolve_display("ones", 99, False, 1.0)["decimals"] == 6)
+    check("a rate metric is never scaled - it is already a percentage",
+          A.resolve_display("billions", 3, True, 98.0)["scale"] == 1.0,
+          str(A.resolve_display("billions", 3, True, 98.0)))
+
+    class _Req:
+        display = {"sales_value": MAIN.DisplaySpec(unit="millions", decimals=3)}
+
+    stamped = _multi_metric_report()
+    MAIN._apply_display(_Req(), [stamped])
+    sv = stamped["metrics"]["sales_value"]["display"]
+    nd = stamped["metrics"]["nd"]["display"]
+    vol = stamped["metrics"]["volume"]["display"]
+    check("the chosen unit reaches the report", sv["scale"] == 1e6 and sv["decimals"] == 3,
+          str(sv))
+    check("a metric with no choice falls back to auto", vol["symbol"] == "Bn",
+          str(vol))
+    check("the distribution metric stays unscaled whatever is asked for",
+          nd["scale"] == 1.0 and nd["unit"] == "percent", str(nd))
+    check("the headline metric's display is on the report itself",
+          stamped["display"] == sv, str(stamped["display"]))
+
+    # --- C. one table per metric, and no contribution for ND ----------------
+    d = os.path.join(OUT, "p14_multi_metric")
+    os.makedirs(d, exist_ok=True)
+    xp = os.path.join(d, "BEER_Impact.xlsx")
+    pp = os.path.join(d, "BEER_Impact.pptx")
+    export_excel.build_category_workbook(stamped, {}, xp)
+    export_pptx.build_category_deck(stamped, {}, pp)
+
+    wb = openpyxl.load_workbook(xp)
+    sheets = wb.sheetnames
+    for tag in ("Value", "Volume", "ND"):
+        check(f"Excel has a channel table for {tag}",
+              any(s.startswith("Channel") and s.endswith(f"({tag})") for s in sheets),
+              f"sheets={sheets}")
+        check(f"Excel has a Manufacturer Top-N and a Brand Top-N for {tag}",
+              any(s.startswith("Manufacturer Top-N") and s.endswith(f"({tag})")
+                  for s in sheets)
+              and any(s.startswith("Brand Top-N") and s.endswith(f"({tag})")
+                      for s in sheets),
+              f"sheets={sheets}")
+    check("Excel still has no summary sheet", "Summary" not in sheets)
+    check("Excel still has no QC sheet", "QC" not in sheets)
+
+    def hdr_of(sheet: str):
+        ws = wb[sheet]
+        return next(r for r in ws.iter_rows(values_only=True) if r and r[0] == "Entity")
+
+    growth_hdr = hdr_of(next(s for s in sheets if s.startswith("Channel") and s.endswith("(Value)")))
+    nd_hdr = hdr_of(next(s for s in sheets if s.startswith("Channel") and s.endswith("(ND)")))
+    check("the growth table keeps its contribution column",
+          any("Contribution" in str(h) for h in growth_hdr), f"{growth_hdr}")
+    check("the distribution table has no contribution column",
+          not any("Contribution" in str(h) for h in nd_hdr), f"{nd_hdr}")
+    check("the distribution table keeps its levels and absolute change",
+          "Absolute change (TY - YA)" in nd_hdr and "BEFORE MAT TY" in nd_hdr,
+          f"{nd_hdr}")
+
+    prs = Presentation(pp)
+    nd_slides = [sl for sl in prs.slides
+                 if any(sh.has_text_frame and "Numeric Distribution" in sh.text_frame.text
+                        and sh.text_frame.text.lower().startswith("market")
+                        for sh in sl.shapes)]
+    check("the deck has a distribution market slide", len(nd_slides) == 1,
+          f"{len(nd_slides)} slide(s)")
+    if nd_slides:
+        tbl = next(sh.table for sh in nd_slides[0].shapes if sh.has_table)
+        hdr = [c.text for c in tbl.rows[0].cells]
+        check("the deck's distribution table drops the contribution columns",
+              not any("Contrib" in h for h in hdr), f"{hdr}")
+        check("the deck's distribution table keeps the levels and the change",
+              "Abs change (TY - YA)" in hdr, f"{hdr}")
+    check("the deck carries one market slide per metric",
+          len([sl for sl in prs.slides
+               if any(sh.has_text_frame and sh.text_frame.text.lower()
+                      .startswith("market / channel") for sh in sl.shapes)]) == 3,
+          "expected 3")
+
+
+# ===========================================================================
+# PART 15 - the deck and the workbook against the client's template
+#
+# Five things the user reported after the first template run:
+#
+#   * every slide arrived with a vertical "Click to add text" placeholder down
+#     its side - the deck was using the LAST layout in the file, "Vertical Title
+#     and Text", because `_blank_layout` tested for "no placeholders at all" and
+#     even the stock "Blank" layout carries date/footer/slide-number ones.
+#   * a "Total (sum of rows above)" row was printed directly under a row already
+#     levelled `total` - a duplicate of the Total Market they had selected.
+#   * "what drove the change" existed for Sales Value only, though the report
+#     carries a contributors block per metric.
+#   * the deck's figures were not colour-coded.
+#   * the analysis shows a separate block for the channels and for the regions,
+#     and the export merged them into one list.
+# ===========================================================================
+
+TOTAL_MKT = "TW Total TW Offline (G)"
+
+
+def _lvl(name, level, ya, ty, ya2, ty2, gp=True, contrib=1.0):
+    def side(a, b):
+        return {"mat_ya": a, "mat_ty": b,
+                "growth_pct": ((b / a - 1) * 100) if (gp and a) else None}
+    return {
+        "name": name, "level": level,
+        "before": side(ya, ty), "after": side(ya2, ty2),
+        "level_shift": {"mat_ty_pp": -1.4, "before_share_pct": 60.0,
+                        "after_share_pct": 58.0},
+        "contribution": {"before_share_pct": 60.0, "after_share_pct": 58.0,
+                         "of_change_pct": contrib},
+        "abs_change": ty2 - ty,
+    }
+
+
+def _deck_metric(key, label, is_rate, gp, scale, symbol, decimals):
+    total = _lvl(TOTAL_MKT, "total", 2.6e10, 2.6e10, 2.6e10, 2.61e10, gp)
+    chans = [_lvl("TW CVS", "channel", 8.7e9, 8.74e9, 9.0e9, 9.35e9, gp),
+             _lvl("TW Chain Super-PX MART", "channel", 3.7e9, 3.74e9,
+                  3.4e9, 3.31e9, gp, -2.6)]
+    regions = [_lvl("TW North", "region", 1.2e9, 1.25e9, 1.3e9, 1.4e9, gp),
+               _lvl("TW South", "region", 0.9e9, 0.95e9, 0.85e9, 0.8e9, gp, -0.4)]
+    topn = lambda p: [{"name": f"{p}{i}", "before_prior": 1e9 - i * 1e7,
+                       "before_current": 1.1e9 - i * 1e7,
+                       "after_prior": 1.2e9 - i * 1e7,
+                       "after_current": 1.25e9 - i * 1e7,
+                       "share_change_pp": -0.4, "rank_before": i + 1,
+                       "rank_after": i + 1, "rank_change": 0,
+                       "movement": "HELD"} for i in range(10)]
+    return {
+        "key": key, "label": label, "is_rate_metric": is_rate,
+        "growth_applicable": gp,
+        "display": {"unit": "auto", "scale": scale, "symbol": symbol,
+                    "decimals": decimals},
+        "total": {"before_prior": 3.85e10, "before_current": 3.846e10,
+                  "after_prior": 3.92e10, "after_current": 3.88e10,
+                  "abs_change": 3.3e8, "level_shift_pp": -0.9,
+                  "before_growth_pct": -0.2, "after_growth_pct": -1.1},
+        "baseline": {"name": TOTAL_MKT},
+        "channel_block": [total] + chans + regions,
+        "channel_level_block": {"level": "channel", "total": total,
+                                "members": chans},
+        "region_level_block": {"level": "region", "total": total,
+                               "members": regions},
+        "market_other_block": None,
+        "manufacturer_top_n": topn("M"), "brand_top_n": topn("B"),
+        "client_brands": [], "client_manufacturers": [],
+        "contributors": [
+            {"level": "manufacturer",
+             "gainers": [{"name": "AB", "abs_change": 1.28e8,
+                          "contribution_to_change_pct": 38.7}],
+             "losers": [{"name": "SUN MAI", "abs_change": -9.2e6,
+                         "contribution_to_change_pct": -2.8}]},
+            {"level": "brand",
+             "gainers": [{"name": "BAR", "abs_change": 7.4e7,
+                          "contribution_to_change_pct": 22.5}],
+             "losers": [{"name": "TIGER", "abs_change": -1.0e7,
+                         "contribution_to_change_pct": -3.1}]},
+        ],
+    }
+
+
+def _deck_report() -> dict:
+    return {
+        "category": "BEER", "metric": "Sales Value", "markets": [TOTAL_MKT],
+        "baseline": {"name": TOTAL_MKT},
+        "display": {"unit": "auto", "scale": 1e9, "symbol": "Bn", "decimals": 2},
+        "metrics": {
+            "sales_value": _deck_metric("sales_value", "Sales Value", False, True,
+                                        1e9, "Bn", 2),
+            "volume": _deck_metric("volume", "Sales Volume", False, True,
+                                   1e6, "M", 1),
+            "nd": _deck_metric("nd", "Numeric Distribution (ND)", True, False,
+                               1.0, "", 0),
+        },
+    }
+
+
+def _run_colour(cell):
+    """The colour on the cell's first run, as a hex string ('' when unset)."""
+    try:
+        runs = cell.text_frame.paragraphs[0].runs
+        if not runs:
+            return ""
+        col = runs[0].font.color
+        return str(col.rgb) if col and col.type is not None else ""
+    except Exception:
+        return ""
+
+
+def part15() -> None:
+    banner("PART 15  template-safe slides, per-level tables, per-metric contributors")
+
+    import openpyxl
+    from pptx import Presentation
+
+    rep = _deck_report()
+    d = os.path.join(OUT, "p15_deck")
+    os.makedirs(d, exist_ok=True)
+    xp = os.path.join(d, "BEER_Impact.xlsx")
+    pp = os.path.join(d, "BEER_Impact.pptx")
+
+    # Built with no template at all: this is the case that produced the vertical
+    # placeholder, because the stock deck's layouts all carry chrome placeholders.
+    export_pptx.build_category_deck(rep, {}, pp, {}, template="__none__.pptx")
+    export_excel.build_category_workbook(rep, {}, xp)
+
+    prs = Presentation(pp)
+    titles = []
+    for sl in prs.slides:
+        t = [sh.text_frame.text for sh in sl.shapes
+             if sh.has_text_frame and sh.text_frame.text.strip()]
+        titles.append(t[0] if t else "")
+
+    # --- A. no placeholder may survive onto a slide -------------------------
+    n_ph = sum(len(sl.placeholders) for sl in prs.slides)
+    check("no slide carries a layout placeholder", n_ph == 0,
+          f"{n_ph} placeholder(s) across {len(prs.slides)} slides")
+    layouts = sorted({sl.slide_layout.name for sl in prs.slides})
+    check("...so no 'Click to add text' box can appear",
+          all("vertical" not in n.lower() for n in layouts), f"layouts={layouts}")
+    check("the deck is built on one consistent layout", len(layouts) == 1,
+          f"layouts={layouts}")
+
+    # --- B. one market slide per level --------------------------------------
+    ch = [t for t in titles if t.startswith("Market / channel")]
+    rg = [t for t in titles if t.startswith("Market / region")]
+    check("a market slide per level, per metric - channels",
+          len(ch) == 3, f"{len(ch)} channel slide(s)")
+    check("a market slide per level, per metric - regions",
+          len(rg) == 3, f"{len(rg)} region slide(s)")
+
+    def table_of(slide):
+        return next(sh.table for sh in slide.shapes if sh.has_table)
+
+    region_slide = next(sl for sl, t in zip(prs.slides, titles)
+                        if t.startswith("Market / region"))
+    rhdr = [c.text for c in table_of(region_slide).rows[0].cells]
+    check("the region slide is headed by regions",
+          rhdr[0] == "Regions", f"header={rhdr[0]!r}")
+    rnames = [r.cells[0].text for r in table_of(region_slide).rows]
+    check("...and lists the region rows",
+          any("TW North" in n for n in rnames) and any("TW South" in n for n in rnames),
+          f"{rnames}")
+
+    # --- C. the Total Market is not duplicated ------------------------------
+    every_cell = [c.text for sl in prs.slides for sh in sl.shapes
+                  if sh.has_table for r in sh.table.rows for c in r.cells]
+    check("the deck prints no 'Total (sum of rows above)' when a Total Market exists",
+          not any("sum of rows" in t for t in every_cell))
+    check("the deck still leads each market table with the Total Market",
+          sum(1 for t in every_cell if t.startswith("Total Market · ")) >= 6,
+          f"{sum(1 for t in every_cell if t.startswith('Total Market · '))} lead rows")
+
+    # --- D. negative figures are colour-coded -------------------------------
+    reds = {c.text for sl in prs.slides for sh in sl.shapes if sh.has_table
+            for r in sh.table.rows for c in r.cells if _run_colour(c) == "C00000"}
+    check("negative figures are printed in red",
+          bool(reds) and all(t.strip().startswith("-") for t in reds),
+          f"{sorted(reds)[:6]}")
+    inked = {c.text for sl in prs.slides for sh in sl.shapes if sh.has_table
+             for r in sh.table.rows for c in r.cells if _run_colour(c) == "1F2837"}
+    check("and positives keep the body colour",
+          any(t.startswith("+") for t in inked),
+          f"{sorted(t for t in inked if t.startswith('+'))[:4]}")
+
+    # --- E. a contributors slide per metric ---------------------------------
+    contrib = [t for t in titles if t.startswith("What drove the change")]
+    check("a 'what drove the change' slide per metric", len(contrib) == 3,
+          f"{contrib}")
+    check("...each naming its own metric",
+          len({t.split(" - ", 1)[1] for t in contrib}) == 3, f"{contrib}")
+
+    # --- F. the workbook: per-level tables in one sheet, per-metric blocks ---
+    wb = openpyxl.load_workbook(xp)
+    sheets = wb.sheetnames
+    check("Excel has a contributors table per metric",
+          all(any(s.startswith("Contributors") and s.endswith(f"({tag})")
+                  for s in sheets) for tag in ("Value", "Volume", "ND")),
+          f"sheets={sheets}")
+    ws = wb[next(s for s in sheets if s.startswith("Channel") and s.endswith("(Value)"))]
+    col_a = [r[0] for r in ws.iter_rows(values_only=True) if r and r[0]]
+    check("the channel sheet carries both the channel and the region table",
+          "Channel" in col_a and "Region" in col_a, f"{col_a[:12]}")
+    check("the channel sheet prints no 'Total (sum of rows above)'",
+          not any(str(v).startswith("Total (") for v in col_a))
+    check("the Total Market leads both tables in the sheet",
+          sum(1 for v in col_a if str(v).startswith("Total Market · ")) == 2,
+          f"{[v for v in col_a if str(v).startswith('Total Market')]}")
+
+    # --- G. a table with no total at all keeps its labelled sum row ---------
+    # The removal must not become a deletion: with nothing levelled `total` the
+    # sum is the only aggregate the table has, and Part 10 already asserts the
+    # Excel side of this. Assert the deck side too, so the two agree.
+    no_total = _deck_report()
+    blk = no_total["metrics"]["sales_value"]
+    blk["baseline"] = {}
+    blk["channel_level_block"] = None
+    blk["region_level_block"] = None
+    blk["channel_block"] = [
+        dict(b, level="channel") for b in blk["channel_block"] if b["level"] != "total"
+    ]
+    pp2 = os.path.join(d, "no_total.pptx")
+    export_pptx.build_category_deck(no_total, {}, pp2, {}, template="__none__.pptx")
+    prs2 = Presentation(pp2)
+    cells2 = [c.text for sl in prs2.slides for sh in sl.shapes
+              if sh.has_table for r in sh.table.rows for c in r.cells]
+    check("with no Total Market the labelled sum row survives in the deck",
+          any(t.startswith("Total (sum of rows above)") for t in cells2))
 
 
 # ===========================================================================
@@ -2214,6 +2790,8 @@ def main() -> int:
     part11()
     part12()
     part13()
+    part14()
+    part15()
     banner("SUMMARY")
     n_pass = sum(1 for _, s, _ in results if s == PASS)
     n_fail = len(results) - n_pass

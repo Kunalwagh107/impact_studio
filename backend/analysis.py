@@ -43,6 +43,66 @@ from .profiling import (
 )
 
 # ----------------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------------
+
+# How many entities each side of the "what drove the change" block lists. One
+# number for both sides, so Gain and Loss are always the same size and read as
+# the two halves of one comparison rather than as two unrelated lists.
+CONTRIBUTOR_N = 5
+
+# Display units a report may be presented in. `auto` picks from the magnitude;
+# the rest are the user's explicit choice in step 5, so Sales Value can be read
+# in billions on every sheet of a run instead of per-sheet.
+DISPLAY_UNITS: dict[str, tuple[float, str]] = {
+    "ones": (1.0, ""),
+    "thousands": (1e3, "K"),
+    "millions": (1e6, "M"),
+    "billions": (1e9, "Bn"),
+}
+
+
+def auto_unit(magnitude: float) -> tuple[float, str]:
+    """The display unit implied by the largest figure in a run."""
+    try:
+        mx = abs(float(magnitude))
+    except Exception:
+        mx = 0.0
+    if mx >= 1e9:
+        return 1e9, "Bn"
+    if mx >= 1e6:
+        return 1e6, "M"
+    if mx >= 1e3:
+        return 1e3, "K"
+    return 1.0, ""
+
+
+def resolve_display(unit: str, decimals: int, is_rate: bool,
+                    magnitude: float = 0.0) -> dict:
+    """The one description of how a metric's numbers are written.
+
+    Returned to the browser and to both exporters, so the screen, the workbook
+    and the deck cannot disagree about whether a figure is in millions or
+    billions. A rate metric is a percentage, not a quantity, so it is never
+    scaled: its unit is the percent it already carries.
+    """
+    if is_rate:
+        return {"unit": "percent", "scale": 1.0, "symbol": "", "decimals": 0}
+    name = (unit or "auto").strip().lower()
+    if name in DISPLAY_UNITS:
+        factor, symbol = DISPLAY_UNITS[name]
+    else:
+        name = "auto"
+        factor, symbol = auto_unit(magnitude)
+    try:
+        dp = int(decimals)
+    except Exception:
+        dp = 2
+    return {"unit": name, "scale": factor, "symbol": symbol,
+            "decimals": max(0, min(dp, 6))}
+
+
+# ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
 
@@ -836,7 +896,28 @@ def _entity_block(
     m["share_change_pp"] = m["after_share_pct"] - m["before_share_pct"]
 
     d_tot = (tot_b - tot_a) if (tot_a and tot_b and np.isfinite(tot_a) and np.isfinite(tot_b)) else np.nan
-    delta = m["b_current"] - m["a_current"]
+    # The change in MAT TY between the two databases.
+    #
+    # A side with no row is **zero, not unknown** for an additive metric: that is
+    # already what the category total assumes (`sum(min_count=1)` over the rows
+    # that exist), so an entity that is new in the updated dataset is a real,
+    # positive movement and one that exited is a real, negative one. Leaving them
+    # as NaN was not harmless - `_contributors` sorts on this column and takes the
+    # tail, and pandas puts NaN last, so the "Gainers" list selected exactly the
+    # entities whose change could not be computed and printed five names with no
+    # figures while "Losers" was fine.
+    #
+    # A rate metric has no zero level, so there a missing side stays unknown.
+    #
+    # Coerced explicitly: on a category that exists on only one side the merged
+    # columns can arrive as object dtype, and an object column then propagates all
+    # the way to a comparison that cannot be made.
+    a_cur = pd.to_numeric(m["a_current"], errors="coerce")
+    b_cur = pd.to_numeric(m["b_current"], errors="coerce")
+    if is_rate:
+        delta = b_cur - a_cur
+    else:
+        delta = b_cur.fillna(0) - a_cur.fillna(0)
     m["abs_change"] = delta
     m["contribution_to_change_pct"] = (
         (delta / d_tot * 100) if d_tot and np.isfinite(d_tot) and abs(d_tot) > 1e-9 else np.nan
@@ -1284,9 +1365,23 @@ def category_report(prep: Prepared, category: str) -> dict:
         blk = _entity_block(a, b, dim_col, cfg.is_rate, wcol, cfg.metric_label,
                             growth_applicable=cfg.growth_applicable)
         blk = blk[blk[dim_col].astype(str).str.len() > 0].copy()
-        blk = blk.sort_values("abs_change")
-        losers = blk.head(5)
-        gainers = blk.tail(5).iloc[::-1]
+        # Gain and Loss are the two sides of the *same* column, selected the same
+        # way: the largest rises and the largest falls, each bounded by zero.
+        #
+        # Two defects lived here. The old code sorted ascending and took
+        # `head(5)` / `tail(5)`, which (a) selected the NaN rows for "Gainers"
+        # because pandas sorts NaN last, and (b) would have listed five *declines*
+        # under "Gain" on a category where nothing rose, since tail() has no
+        # sign test. Both sides are now drawn from rows that carry a change, and
+        # each is bounded by zero, so "Gain" is never a fall with the sign
+        # dropped and "Loss" is never a rise.
+        val = blk.copy()
+        val["abs_change"] = pd.to_numeric(val["abs_change"], errors="coerce")
+        val = val[val["abs_change"].notna()]
+        gainers = (val[val["abs_change"] > 0]
+                   .sort_values("abs_change", ascending=False).head(CONTRIBUTOR_N))
+        losers = (val[val["abs_change"] < 0]
+                  .sort_values("abs_change", ascending=True).head(CONTRIBUTOR_N))
         contribs.append({
             "level": dim_key,
             "gainers": [

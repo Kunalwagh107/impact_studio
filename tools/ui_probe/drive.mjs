@@ -277,6 +277,21 @@ async function main() {
   check('backend health reported', /engine ok/.test(shell.health || ''),
         String(shell.health))
   check('step 1 is the active step on arrival', await activeStep() === '1')
+  // A card whose body is filled only by a later step must still say something on
+  // arrival. The Display units card rendered its heading and its hint while its
+  // body was empty - which reads as a broken control, and is indistinguishable
+  // from the JavaScript that fills it never having run.
+  const emptyCards = await evaluate(`(() => {
+    const out = []
+    for (const el of document.querySelectorAll('.panel .card')) {
+      const body = [...el.children].filter(c => !c.classList.contains('card-head'))
+      const text = body.map(c => (c.innerText || '').trim()).join('')
+      if (!text) out.push(el.querySelector('h3')?.textContent || '?')
+    }
+    return out
+  })()`)
+  check('no card renders with an empty body on arrival',
+        emptyCards.length === 0, `empty: ${JSON.stringify(emptyCards)}`)
   // A malformed SVG still returns 200, so decode it rather than trusting the
   // response code. (An XML comment containing "--" breaks parsing.)
   const fav = await evaluate(`new Promise(r => {
@@ -896,6 +911,71 @@ async function main() {
         backToOne.onCount === 1 && backToOne.periods === 1,
         `on=${backToOne.onCount} periods=${backToOne.periods}`)
 
+  // The display unit and decimals for Sales Value. The choice has to reach the
+  // request, not merely the panel: the workbooks and decks are built from it, and
+  // a screen-only setting would let the same figure appear in millions here and
+  // billions in the export.
+  const dispBefore = await evaluate(`({
+    rows: document.querySelectorAll('#c-display [data-disp-unit]').length,
+    opts: (document.querySelector('#c-display [data-disp-unit]') || {}).options?.length || 0,
+    decOpts: (document.querySelector('#c-display [data-disp-dec]') || {}).options?.length || 0 })`)
+  console.log('  display picker:', JSON.stringify(dispBefore))
+  check('a display unit picker is offered for the selected quantity metric',
+        dispBefore.rows === 1 && dispBefore.opts === 5 && dispBefore.decOpts === 5,
+        `rows=${dispBefore.rows} units=${dispBefore.opts} decimals=${dispBefore.decOpts}`)
+  await evaluate(`(() => {
+    const u = document.querySelector('#c-display [data-disp-unit]')
+    u.value = 'billions'; u.dispatchEvent(new Event('change', { bubbles: true }))
+    const d = document.querySelector('#c-display [data-disp-dec]')
+    d.value = '1'; d.dispatchEvent(new Event('change', { bubbles: true }))
+    return 'ok'
+  })()`)
+  await sleep(300)
+  const dispState = await evaluate(`JSON.stringify(window.S.display.sales_value)`)
+  check('the display choice is held in the app state',
+        /"unit":"billions"/.test(dispState) && /"decimals":1/.test(dispState), dispState)
+  // Ticking a second quantity metric adds its row; unticking takes it away.
+  await evaluate(`(() => {
+    document.querySelector('#c-metric-picks input[data-metric="volume"]').click()
+    return 'ok'
+  })()`)
+  await sleep(400)
+  check('ticking Volume adds its display row',
+        await evaluate(`document.querySelectorAll('#c-display [data-disp-unit]').length`) === 2)
+  await evaluate(`(() => {
+    document.querySelector('#c-metric-picks input[data-metric="volume"]').click()
+    return 'ok'
+  })()`)
+  await sleep(400)
+  check('unticking it takes the row away again',
+        await evaluate(`document.querySelectorAll('#c-display [data-disp-unit]').length`) === 1)
+
+  // Arriving at step 5 must repaint the picker from scratch. Blank the box, leave
+  // the step, and come back the way a user does - by clicking the stepper - then
+  // check it refilled. This is the guard for a card that renders its heading and
+  // its hint while its body stays empty, which is what the user reported: it
+  // looks identical whether the control failed or the code that fills it never
+  // ran.
+  await evaluate(`(() => {
+    document.querySelector('#c-display').innerHTML = ''
+    document.querySelectorAll('.step')[3].click()      // back to step 4
+    return 'ok'
+  })()`)
+  await sleep(400)
+  await evaluate(`(() => {
+    document.querySelectorAll('.step')[4].click()      // forward to step 5
+    return 'ok'
+  })()`)
+  await sleep(500)
+  const repainted = await evaluate(`({
+    step: document.querySelector('.panel[data-panel="5"]')?.hidden === false,
+    rows: document.querySelectorAll('#c-display [data-disp-unit]').length,
+    unit: (document.querySelector('#c-display [data-disp-unit]') || {}).value })`)
+  check('arriving at step 5 repopulates the display picker',
+        repainted.step && repainted.rows === 1, JSON.stringify(repainted))
+  check('and it keeps the unit the user chose',
+        repainted.unit === 'billions', JSON.stringify(repainted))
+
   // narrow to the authored categories deterministically - the same names mapped
   // in step 4, so the two halves of the walk agree by construction.
   const TARGETS = AUTHOR_TARGETS
@@ -976,6 +1056,35 @@ async function main() {
   // QC tab (asserted below), not over the numbers.
   check('no warning box sits above the KPIs, only the QC status line',
         run.noticesAboveKpis === 1, `${run.noticesAboveKpis} notice(s) above the KPIs`)
+
+  // The unit chosen in step 5 must be the unit the analysis actually writes -
+  // billions with one decimal here. A picker that only repaints its own panel
+  // would leave the figures scaled the old way.
+  const unitMatch = (run.body.match(/[\d,]+\.\dBn/) || [])[0]
+  check('the analysis writes the unit and decimals chosen in step 5',
+        Boolean(unitMatch), unitMatch || 'no "<n>.<d>Bn" figure found')
+
+  // Gain and Loss must both carry figures. The defect this guards against: the
+  // contributor selection sorted on a column that could not be computed for a
+  // one-sided entity, and pandas sorts those last - so "Gainers" listed names
+  // with blank values while "Losers" was fine.
+  const contrib = await evaluate(`(() => {
+    const h = [...document.querySelectorAll('#run-body h4')]
+      .find(x => /what drove the change/i.test(x.textContent || ''))
+    if (!h) return null
+    const blk = h.closest('.blk')
+    return [...blk.querySelectorAll('tbody tr')].map(tr =>
+      [...tr.querySelectorAll('td')].map(td => td.textContent.trim()))
+  })()`)
+  if (contrib) {
+    const directional = contrib.filter(r => r[1] === 'Gain' || r[1] === 'Loss')
+    const blank = directional.filter(r => !r[2] || r[2] === '–')
+    check('every Gain and Loss row carries a figure',
+          directional.length > 0 && blank.length === 0,
+          `${directional.length} row(s), ${blank.length} blank`)
+  } else {
+    console.log('  note: no "what drove the change" block on this category')
+  }
   // Scroll to the top before the screenshot. `Page.captureScreenshot` captures
   // the *viewport*, and the walk has scrolled a long way down by now - so this
   // shot used to document the Top-N tables and never the headline the step is

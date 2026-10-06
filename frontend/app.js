@@ -38,6 +38,13 @@ const S = {
   // can be selected; each is resolved independently on the two datasets.
   metricSel: { sales_value: true, volume: false, nd: false },
   metricWiring: {},
+  // How each metric's numbers are written, keyed by metric key: the unit the
+  // user picks in step 5 and the number of decimals. Carried into the request so
+  // the analysis, the workbook and the deck all read the same figures - scaling
+  // each view from its own slice is how the same figure ends up in millions on
+  // one screen and billions on the next. ND is a percentage and is never scaled.
+  display: { sales_value: { unit: 'auto', decimals: 2 },
+             volume: { unit: 'auto', decimals: 2 } },
   selection: { markets: [], categories: [], top_n: 10, clients: [] },
   result: null,
   exportResult: null,
@@ -102,11 +109,29 @@ function scaleOf(...vals) {
   return [1, ''];
 }
 
-function fmtVal(v, scale = 1, unit = '') {
+function fmtVal(v, scale = 1, unit = '', dp) {
   if (v === null || v === undefined || !isFinite(v)) return '–';
   const x = v / scale;
-  const dp = unit ? 2 : 0;
-  return fmtNum(x, dp) + unit;
+  const places = (dp === null || dp === undefined) ? (unit ? 2 : 0) : dp;
+  return fmtNum(x, places) + unit;
+}
+
+/**
+ * Format a figure in the unit the run resolved for its metric.
+ *
+ * `disp` is the `display` block the server stamps onto every metric: the scale
+ * factor, the symbol and the decimal count. Passing it through everywhere is
+ * what keeps the screen, the workbook and the deck on the same unit; a missing
+ * block falls back to the old automatic behaviour rather than guessing.
+ */
+function fmtDisp(v, disp) {
+  if (!disp) return fmtVal(v);
+  return fmtVal(v, disp.scale || 1, disp.symbol || '', disp.decimals || 0);
+}
+
+/** The display block for a metric, with a safe default. */
+function dispOf(m) {
+  return (m && m.display) || { scale: 1, symbol: '', decimals: 0, unit: 'auto' };
 }
 
 function cls(v) {
@@ -135,6 +160,12 @@ function go(step) {
     b.classList.toggle('active', n === step);
     b.classList.toggle('done', n < step);
   });
+  // The display picker is derived purely from the current metric selection, so
+  // arriving at step 5 repaints it. This is the *only* thing safe to rebuild on
+  // arrival: `buildSelectionUI()` also runs here for the step-4 hand-off, but it
+  // resets the category selection to "all", so calling it from a plain
+  // navigation would silently discard the user's narrowing.
+  if (step === 5) renderDisplayUnits();
   window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
@@ -408,7 +439,23 @@ document.addEventListener('change', e => {
     S.metricSel[mpick.dataset.metric] = mpick.checked;
     renderMetricPicks();
     renderMetricPeriods();
+    // The display rows follow the metric selection: untick Volume and its unit
+    // picker goes with it.
+    renderDisplayUnits();
     validateMetricWiring();
+    return;
+  }
+  // The unit and decimal count for a metric's figures.
+  const dunit = e.target.closest('[data-disp-unit]');
+  if (dunit) {
+    const k = dunit.dataset.dispUnit;
+    S.display[k] = { ...(S.display[k] || { decimals: 2 }), unit: dunit.value };
+    return;
+  }
+  const ddec = e.target.closest('[data-disp-dec]');
+  if (ddec) {
+    const k = ddec.dataset.dispDec;
+    S.display[k] = { ...(S.display[k] || { unit: 'auto' }), decimals: Number(ddec.value) };
     return;
   }
   // Period selects live inside the metric wiring blocks; any change re-validates
@@ -1317,6 +1364,7 @@ function buildSelectionUI() {
   renderMetricPicks();
   renderMetricWiring(famsA, famsB);
   renderMetricPeriods();
+  renderDisplayUnits();
   // Paint the wiring verdict now, not only on the next change. Without this the
   // user arrives on step 5 to a blank confirmation box, which reads as "the
   // metric is not wired" even though it is.
@@ -1414,6 +1462,56 @@ function renderMetricPicks() {
       + 'no percentage growth, because a distribution level has no meaningful growth rate');
     rule.innerHTML = bits.length ? 'Note: ' + bits.join('; ') + '.' : '';
   }
+}
+
+/**
+ * How Sales Value and Volume are written: the unit, and the decimals.
+ *
+ * Only the additive metrics get a row. ND is a distribution level - a percentage
+ * out of 100 - so there is no unit to choose and nothing to scale, and offering
+ * one would invite a reader to treat "98" as 98 of something.
+ *
+ * The choice is not only a screen setting: it is sent with the run and drives the
+ * Excel workbooks and the PowerPoint decks as well, so one figure cannot be in
+ * millions on screen and billions in the deck.
+ */
+const DISPLAY_UNITS = [
+  ['auto', 'Auto (from the data)'],
+  ['ones', 'Ones'],
+  ['thousands', 'Thousands (K)'],
+  ['millions', 'Millions (M)'],
+  ['billions', 'Billions (Bn)'],
+];
+
+function renderDisplayUnits() {
+  const box = $('#c-display');
+  if (!box) return;
+  // Defensive: a state object from an older build (or a probe that replaced
+  // `window.S`) must not turn this into a silent no-op that leaves an empty box.
+  if (!S.display || typeof S.display !== 'object') S.display = {};
+  const sel = METRIC_DEFS.filter(d => S.metricSel[d.key] && !d.is_rate);
+  if (!sel.length) {
+    box.innerHTML = '<p class="hint" style="padding:6px 0">No quantity metric is '
+      + 'selected. A distribution level is a percentage and is never scaled.</p>';
+    return;
+  }
+  box.innerHTML = sel.map(def => {
+    if (!S.display[def.key]) S.display[def.key] = { unit: 'auto', decimals: 2 };
+    const cur = S.display[def.key];
+    return `<div class="field" style="margin:0 0 10px">
+      <label>${esc(def.label)}</label>
+      <div class="grid two tight">
+        <select data-disp-unit="${def.key}">
+          ${DISPLAY_UNITS.map(([v, t]) =>
+            `<option value="${v}" ${v === cur.unit ? 'selected' : ''}>${esc(t)}</option>`).join('')}
+        </select>
+        <select data-disp-dec="${def.key}">
+          ${[0, 1, 2, 3, 4].map(n =>
+            `<option value="${n}" ${Number(cur.decimals) === n ? 'selected' : ''}>${n} decimal${n === 1 ? '' : 's'}</option>`).join('')}
+        </select>
+      </div>
+    </div>`;
+  }).join('');
 }
 
 /**
@@ -1898,6 +1996,10 @@ function runRequest() {
     weight_metric_a: primary.weight_metric_a || '',
     weight_metric_b: primary.weight_metric_b || '',
     metrics,
+    // The unit and decimal count the user chose for each metric's figures. The
+    // server resolves it into a scale and returns it with the report, so the
+    // screen and both exports write the same numbers the same way.
+    display: S.display || {},
     markets: S.selection.markets,
     categories: S.selection.categories,
     top_n: topN(),
@@ -1949,7 +2051,15 @@ function renderRun() {
 
   const totB = cats.reduce((s, r) => s + (r.total.before_current || 0), 0);
   const totA = cats.reduce((s, r) => s + (r.total.after_current || 0), 0);
-  const [scale, unit] = scaleOf(totB, totA);
+  // The run totals belong to the headline metric, so they are written in the unit
+  // the run resolved for that metric - the same unit every workbook and deck in
+  // the run uses. A report with no display block (an older one) falls back to the
+  // magnitude, which is what this screen used to do on its own.
+  const head = cats.length ? cats[0].display : null;
+  const [autoScale, autoUnit] = scaleOf(totB, totA);
+  const scale = head ? (head.scale || 1) : autoScale;
+  const unit = head ? (head.symbol || '') : autoUnit;
+  const dp = head ? (head.decimals || 0) : (unit ? 2 : 0);
 
   const qcBanner = {
     PASS: `<div class="notice ok">Automated QC passed — ${qc.counts.PASS} checks.</div>`,
@@ -1973,10 +2083,10 @@ function renderRun() {
         <div class="k-value">${cats.length}</div>
         <div class="k-sub">${esc(d.categories.slice(0, 3).join(', '))}${cats.length > 3 ? '…' : ''}</div></div>
       <div class="kpi neutral"><div class="k-label">Total BEFORE (MAT TY)</div>
-        <div class="k-value">${fmtVal(totB, scale, unit)}</div>
+        <div class="k-value">${fmtVal(totB, scale, unit, dp)}</div>
         <div class="k-sub">sum across selected categories</div></div>
       <div class="kpi neutral"><div class="k-label">Total AFTER (MAT TY)</div>
-        <div class="k-value">${fmtVal(totA, scale, unit)}</div>
+        <div class="k-value">${fmtVal(totA, scale, unit, dp)}</div>
         <div class="k-sub">sum across selected categories</div></div>
       <div class="kpi ${totA >= totB ? 'good' : 'bad'}"><div class="k-label">Impact on total</div>
         <div class="k-value">${pct(totB ? (totA / totB - 1) * 100 : null)}</div>
@@ -1992,7 +2102,7 @@ function renderRun() {
     </div>
     <div id="run-body"></div>`;
 
-  const showCat = i => renderCategory(cats[i], scale, unit);
+  const showCat = i => renderCategory(cats[i]);
   const showQC = () => renderQC(qc, notes);
   $$('#run-tabs .tab').forEach(t => t.onclick = () => {
     $$('#run-tabs .tab').forEach(x => x.classList.remove('active'));
@@ -2002,17 +2112,18 @@ function renderRun() {
   showCat(0);
 }
 
-function renderCategory(rep, scale, unit) {
+function renderCategory(rep) {
   // A multi-metric run carries `rep.metrics` — one block per selected metric,
-  // each with its own total, channel block and insights. Render one section per
-  // metric so a category shows Sales Value, Volume and ND side by side rather
-  // than only the primary. Legacy single-metric reports fall back to the
-  // top-level fields (the server copies metric 1 there).
+  // each with its own total, channel block, display unit and insights. Render one
+  // section per metric so a category shows Sales Value, Volume and ND side by
+  // side rather than only the primary. Legacy single-metric reports fall back to
+  // the top-level fields (the server copies metric 1 there).
   const metrics = (rep.metrics && Object.keys(rep.metrics).length)
     ? Object.values(rep.metrics)
     : [{ key: rep.metric_key || 'metric', label: rep.metric || 'Metric',
          is_rate_metric: !!rep.is_rate_metric,
          growth_applicable: rep.growth_applicable !== false,
+         display: rep.display,
          total: rep.total, channel_block: rep.channel_block,
          channel_level_block: rep.channel_level_block,
          region_level_block: rep.region_level_block,
@@ -2026,30 +2137,36 @@ function renderCategory(rep, scale, unit) {
   // The entity-level tables (rank movement, client entities, contributors) are
   // reported once per metric, since the ranking itself can differ by metric.
   $('#run-body').innerHTML = metrics.map((m, i) =>
-    renderMetricSection(m, scale, unit, metrics.length > 1 ? i + 1 : 0,
-      metrics.length)).join('');
+    renderMetricSection(m, metrics.length > 1 ? i + 1 : 0, metrics.length)).join('');
 }
 
 /**
  * One metric's view of a category. When `growth_applicable` is false (ND), the
  * growth and level-shift columns are replaced by TY / YA / absolute change —
  * a distribution level has no meaningful percentage growth.
+ *
+ * Every figure is written in this metric's own display unit, which the server
+ * resolved once for the whole run, so the same number cannot appear in millions
+ * here and billions in the workbook.
  */
-function renderMetricSection(m, scale, unit, ordinal, totalMetrics) {
+function renderMetricSection(m, ordinal, totalMetrics) {
   const t = m.total || {};
   const g = m.growth_applicable !== false;
+  const disp = dispOf(m);
+  const f = v => fmtDisp(v, disp);
 
   const heading = totalMetrics > 1
-    ? `<h3 class="metric-head">${ordinal}. ${esc(m.label)}</h3>` : '';
+    ? `<h3 class="metric-head">${ordinal}. ${esc(m.label)}${
+        disp.symbol ? ` <span class="hint">· ${esc(disp.symbol)}</span>` : ''}</h3>` : '';
 
   return `${heading}
     <div class="kpis">
       <div class="kpi neutral"><div class="k-label">BEFORE · MAT TY</div>
-        <div class="k-value">${fmtVal(t.before_current, scale, unit)}</div>
-        <div class="k-sub">MAT YA ${fmtVal(t.before_prior, scale, unit)}</div></div>
+        <div class="k-value">${f(t.before_current)}</div>
+        <div class="k-sub">MAT YA ${f(t.before_prior)}</div></div>
       <div class="kpi neutral"><div class="k-label">AFTER · MAT TY</div>
-        <div class="k-value">${fmtVal(t.after_current, scale, unit)}</div>
-        <div class="k-sub">MAT YA ${fmtVal(t.after_prior, scale, unit)}</div></div>
+        <div class="k-value">${f(t.after_current)}</div>
+        <div class="k-sub">MAT YA ${f(t.after_prior)}</div></div>
       ${g ? `
       <div class="kpi ${cls(t.before_growth_pct) === 'neg' ? 'bad' : 'good'}">
         <div class="k-label">BEFORE growth</div>
@@ -2064,19 +2181,19 @@ function renderMetricSection(m, scale, unit, ordinal, totalMetrics) {
         <div class="k-value">${pp(t.level_shift_pp)}</div>
         <div class="k-sub">after growth − before growth</div></div>` : `
       <div class="kpi neutral"><div class="k-label">Absolute change (TY − YA)</div>
-        <div class="k-value">${fmtVal((t.after_current || 0) - (t.after_prior || 0), scale, unit)}</div>
+        <div class="k-value">${f((t.after_current || 0) - (t.after_prior || 0))}</div>
         <div class="k-sub">AFTER · distribution level</div></div>
       <div class="kpi neutral"><div class="k-label">Growth</div>
         <div class="k-value">n/a</div>
         <div class="k-sub">not applicable to a distribution level</div></div>`}
       <div class="kpi ${cls(t.abs_change) === 'neg' ? 'bad' : 'good'}">
         <div class="k-label">Absolute change</div>
-        <div class="k-value">${fmtVal(t.abs_change, scale, unit)}</div>
+        <div class="k-value">${f(t.abs_change)}</div>
         <div class="k-sub">on MAT TY</div></div>
     </div>
 
-    ${renderMarketBlocks(m, scale, unit, g)}
-    ${renderEntities({ ...m, contributors: m.contributors }, { scale, unit, g })}
+    ${renderMarketBlocks(m, disp, g)}
+    ${renderEntities(m, { disp, g })}
   `;
 }
 
@@ -2089,7 +2206,7 @@ function renderMetricSection(m, scale, unit, ordinal, totalMetrics) {
  * wrong. A block is only drawn when the user paired at least one value at that
  * level, so a run with no regions simply has no region block.
  */
-function renderMarketBlocks(m, scale, unit, g) {
+function renderMarketBlocks(m, disp, g) {
   const levels = [
     ['channel', 'Market / Channel block', 'channels'],
     ['region', 'Market / Region block', 'regions'],
@@ -2103,8 +2220,8 @@ function renderMarketBlocks(m, scale, unit, g) {
     const rows = [...(blk.members || [])];
     return `<div class="blk">
       <div class="blk-head"><h4>${esc(title)}</h4>
-        <span class="sub">${esc(m.label)}${unit ? ' (' + unit + ')' : ''} · Total Market, then the ${esc(noun)} beneath it${g
-          ? ' — level shift and contribution' : ' — absolute change and share'}</span></div>
+        <span class="sub">${esc(m.label)}${disp.symbol ? ' (' + esc(disp.symbol) + ')' : ''} · Total Market, then the ${esc(noun)} beneath it${g
+          ? ' — level shift and contribution' : ' — absolute change and share, no contribution'}</span></div>
       <div class="tbl-wrap"><table>
         <thead>${g ? `<tr>
             <th rowspan="2">${esc(key === 'region' ? 'Regions' : key === 'channel' ? 'Channels' : 'Markets')}</th>
@@ -2123,35 +2240,41 @@ function renderMarketBlocks(m, scale, unit, g) {
             <th colspan="2" class="grp-before">BEFORE</th>
             <th colspan="2" class="grp-after">AFTER</th>
             <th colspan="2">Change</th>
-            <th colspan="2">Contribution · MAT TY</th>
           </tr>
           <tr>
             <th>MAT YA</th><th>MAT TY</th>
             <th>MAT YA</th><th>MAT TY</th>
             <th>Abs (TY − YA)</th><th>Share</th>
-            <th>Before</th><th>After</th>
           </tr>`}</thead>
         <tbody>
-          ${tot ? renderMarketRow(tot, scale, unit, g, true) : ''}
-          ${rows.map(c => renderMarketRow(c, scale, unit, g, false)).join('')}
+          ${tot ? renderMarketRow(tot, disp, g, true) : ''}
+          ${rows.map(c => renderMarketRow(c, disp, g, false)).join('')}
         </tbody>
       </table></div>
     </div>`;
   }).join('');
 }
 
-/** One row of a market block: the Total (class `total`) or a member. */
-function renderMarketRow(c, scale, unit, g, isTotal) {
+/**
+ * One row of a market block: the Total (class `total`) or a member.
+ *
+ * For a metric with no growth (Numeric Distribution) there are **no contribution
+ * columns**, on request: a distribution level is not an accumulating quantity, so
+ * a share of the category's change is not a meaningful reading of it. The levels,
+ * the absolute change and the plain share remain.
+ */
+function renderMarketRow(c, disp, g, isTotal) {
   const label = isTotal ? `Total Market${c.name ? ' · ' + c.name : ''}` : c.name;
   const cls0 = isTotal ? ' class="total"' : '';
+  const f = v => fmtDisp(v, disp);
   if (g) {
     return `<tr${cls0}>
       <td>${esc(label)}</td>
-      <td class="num">${fmtVal(c.before.mat_ya, scale, unit)}</td>
-      <td class="num">${fmtVal(c.before.mat_ty, scale, unit)}</td>
+      <td class="num">${f(c.before.mat_ya)}</td>
+      <td class="num">${f(c.before.mat_ty)}</td>
       <td class="num ${cls(c.before.growth_pct)}">${pct(c.before.growth_pct)}</td>
-      <td class="num">${fmtVal(c.after.mat_ya, scale, unit)}</td>
-      <td class="num">${fmtVal(c.after.mat_ty, scale, unit)}</td>
+      <td class="num">${f(c.after.mat_ya)}</td>
+      <td class="num">${f(c.after.mat_ty)}</td>
       <td class="num ${cls(c.after.growth_pct)}">${pct(c.after.growth_pct)}</td>
       <td class="num ${cls(c.level_shift.mat_ty_pp)}">${pp(c.level_shift.mat_ty_pp)}</td>
       <td class="num">${fmtNum(c.level_shift.before_share_pct, 1)}%</td>
@@ -2160,21 +2283,20 @@ function renderMarketRow(c, scale, unit, g, isTotal) {
       <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
     </tr>`;
   }
+  const abs = (c.after.mat_ty || 0) - (c.after.mat_ya || 0);
   return `<tr${cls0}>
     <td>${esc(label)}</td>
-    <td class="num">${fmtVal(c.before.mat_ya, scale, unit)}</td>
-    <td class="num">${fmtVal(c.before.mat_ty, scale, unit)}</td>
-    <td class="num">${fmtVal(c.after.mat_ya, scale, unit)}</td>
-    <td class="num">${fmtVal(c.after.mat_ty, scale, unit)}</td>
-    <td class="num ${cls((c.after.mat_ty || 0) - (c.after.mat_ya || 0))}">${fmtVal((c.after.mat_ty || 0) - (c.after.mat_ya || 0), scale, unit)}</td>
-    <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
-    <td class="num">${fmtNum(c.contribution.before_share_pct, 1)}%</td>
-    <td class="num">${fmtNum(c.contribution.after_share_pct, 1)}%</td>
+    <td class="num">${f(c.before.mat_ya)}</td>
+    <td class="num">${f(c.before.mat_ty)}</td>
+    <td class="num">${f(c.after.mat_ya)}</td>
+    <td class="num">${f(c.after.mat_ty)}</td>
+    <td class="num ${cls(abs)}">${f(abs)}</td>
+    <td class="num">${fmtNum(c.level_shift.after_share_pct, 1)}%</td>
   </tr>`;
 }
 
 /** Brand / manufacturer / client tables and the contributor grid, per metric. */
-function renderEntities(m, { scale, unit, g }) {
+function renderEntities(m, { disp, g }) {
   // The brand *value share* block was removed on request. Brand Top-N and the
   // client-brand tracker are separate tables and are unaffected - one answers
   // "who is biggest and how did they move", the other "how are our named brands
@@ -2182,6 +2304,7 @@ function renderEntities(m, { scale, unit, g }) {
   const mt = m.manufacturer_top_n || [];
   const bt = m.brand_top_n || [];
   const rep = m;
+  const f = v => fmtDisp(v, disp);
   // The ranked tables read exactly like the Market block: the MAT YA / MAT TY
   // levels of BEFORE and AFTER first, then the share change, then the ranks.
   // Rank-first buried the levels behind a position, and the movement is what the
@@ -2208,10 +2331,10 @@ function renderEntities(m, { scale, unit, g }) {
           <tbody>
             ${rows.map(b => `<tr class="${b.movement === 'NEW' || b.movement === 'EXITED' ? 'hi' : ''}">
               <td>${esc(b.name)}</td>
-              <td class="num">${fmtVal(b.before_prior, scale, unit)}</td>
-              <td class="num">${fmtVal(b.before_current, scale, unit)}</td>
-              <td class="num">${fmtVal(b.after_prior, scale, unit)}</td>
-              <td class="num">${fmtVal(b.after_current, scale, unit)}</td>
+              <td class="num">${f(b.before_prior)}</td>
+              <td class="num">${f(b.before_current)}</td>
+              <td class="num">${f(b.after_prior)}</td>
+              <td class="num">${f(b.after_current)}</td>
               <td class="num ${cls(b.share_change_pp)}">${pp(b.share_change_pp)}</td>
               <td class="num">${b.rank_before ?? '–'}</td>
               <td class="num">${b.rank_after ?? '–'}</td>
@@ -2256,10 +2379,10 @@ function renderEntities(m, { scale, unit, g }) {
                 ? `<tr><td>${esc(b.name)}</td><td style="text-align:left">${lvl}</td>
                      <td colspan="9" style="text-align:left;color:var(--muted)">not present in either dataset</td></tr>`
                 : `<tr><td>${esc(b.name)}</td><td style="text-align:left">${lvl}</td>
-                     <td class="num">${fmtVal(b.before_prior, scale, unit)}</td>
-                     <td class="num">${fmtVal(b.before_current, scale, unit)}</td>
-                     <td class="num">${fmtVal(b.after_prior, scale, unit)}</td>
-                     <td class="num">${fmtVal(b.after_current, scale, unit)}</td>
+                     <td class="num">${f(b.before_prior)}</td>
+                     <td class="num">${f(b.before_current)}</td>
+                     <td class="num">${f(b.after_prior)}</td>
+                     <td class="num">${f(b.after_current)}</td>
                      <td class="num ${cls(b.share_change_pp)}">${pp(b.share_change_pp)}</td>
                      <td class="num">${b.rank_before ?? '–'}</td>
                      <td class="num">${b.rank_after ?? '–'}</td>
@@ -2273,7 +2396,8 @@ function renderEntities(m, { scale, unit, g }) {
     ${(rep.contributors || []).length ? `
     <div class="blk">
       <div class="blk-head"><h4>What drove the change</h4>
-        <span class="sub">largest absolute movers</span></div>
+        <span class="sub">largest absolute gainers and losers — both sides read the
+          same way, and both carry an absolute change and a contribution</span></div>
       <div class="grid two">
         ${rep.contributors.map(c => `
           <div>
@@ -2281,20 +2405,34 @@ function renderEntities(m, { scale, unit, g }) {
             <div class="tbl-wrap"><table>
               <thead><tr><th>Entity</th><th>Dir</th><th>Abs change</th><th>Contrib.</th></tr></thead>
               <tbody>
-                ${c.gainers.map(g2 => `<tr><td>${esc(g2.name)}</td>
-                  <td style="text-align:left" class="pos">Gain</td>
-                  <td class="num">${fmtVal(g2.abs_change, scale, unit)}</td>
-                  <td class="num ${cls(g2.contribution_to_change_pct)}">${pct(g2.contribution_to_change_pct)}</td></tr>`).join('')}
-                ${c.losers.map(g2 => `<tr><td>${esc(g2.name)}</td>
-                  <td style="text-align:left" class="neg">Loss</td>
-                  <td class="num">${fmtVal(g2.abs_change, scale, unit)}</td>
-                  <td class="num ${cls(g2.contribution_to_change_pct)}">${pct(g2.contribution_to_change_pct)}</td></tr>`).join('')}
+                ${contribRows(c.gainers, 'Gain', 'pos', 'no entity gained in this category', f)}
+                ${contribRows(c.losers, 'Loss', 'neg', 'no entity lost in this category', f)}
               </tbody>
             </table></div>
           </div>`).join('')}
       </div>
     </div>` : ''}
   `;
+}
+
+/**
+ * The rows of one half of the contributor table.
+ *
+ * Gain and Loss are the two sides of the same comparison, so both are rendered by
+ * this one function and carry the same two figures. A half with no entities says
+ * so in words: it used to render five names with blank figures, because the
+ * selection sorted on a column that could not be computed for those rows and
+ * pandas puts an uncomputable value last - so "Gainers" was drawn from exactly
+ * the entities whose change was unknown.
+ */
+function contribRows(rows, direction, tone, emptyText, f) {
+  if (!rows || !rows.length) {
+    return `<tr><td colspan="4" style="text-align:left;color:var(--muted)">${esc(emptyText)}</td></tr>`;
+  }
+  return rows.map(r => `<tr><td>${esc(r.name)}</td>
+    <td style="text-align:left" class="${tone}">${direction}</td>
+    <td class="num">${f(r.abs_change)}</td>
+    <td class="num ${cls(r.contribution_to_change_pct)}">${pct(r.contribution_to_change_pct)}</td></tr>`).join('');
 }
 
 /**

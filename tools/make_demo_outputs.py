@@ -8,7 +8,7 @@ current code.
     python tools/make_demo_outputs.py [--categories 10] [--run-name TW_Impact_Study]
 
 Writes to outputs/<run-name>/ : one folder per category containing
-<Category>_Impact.xlsx and <Category>_Impact.pptx, plus 00_QC_and_Index.xlsx.
+<Category>_Impact.xlsx and <Category>_Impact.pptx, plus 00_Index.xlsx.
 """
 
 from __future__ import annotations
@@ -149,6 +149,10 @@ def main() -> int:
         "markets": [p["market_a"] for p in pairs], "market_pairs": market_pairs,
         "market_level": "all", "baseline_market": TOTAL_A,
         "categories": cats, "top_n": 10,
+        # The display unit the user picks in step 5. Sent here so the demo output
+        # exercises it: every workbook and deck in the run should read billions
+        # with two decimals rather than each sheet scaling itself.
+        "display": {"sales_value": {"unit": "billions", "decimals": 2}},
         "client_brands": ["WEIDER", "CENTRUM", "BLACKMORES", "DHC"],
         "mapping_a": mapping_a, "mapping_b": mapping_b,
         "category_mapping": category_mapping, "trend_enabled": False,

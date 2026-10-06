@@ -62,9 +62,9 @@ left a server running, the app will be on a different port than you expect.
 | **2 · Profile** | Both datasets are read and profiled: rows, columns, null rates, cardinality, detected dimensions and metric families. Column roles are editable. |
 | **3 · Dimension Mapping** | Markets, manufacturers and brands are matched A→B with layered evidence. Each row shows status, method, confidence and why. **The market hierarchy is identified here too** — see below. |
 | **4 · Category Mapping** | Categories are mapped explicitly — 1:1, composite, 1:N or N:1. Worked **one category at a time** by default. See below. |
-| **5 · Selection** | Metric (per dataset) and periods, the market level, categories, Top-N, client entities to track, and the client / impact name. |
+| **5 · Selection** | Metric (per dataset), periods, display unit and decimals, the market level, categories, Top-N, client entities to track, and the client / impact name. |
 | **6 · Analysis & QC** | The headline insights (MAT AD Growth, MAT AD Level Shift, Contribution), before/after comparison, Top-N movement, and the automated validation results. |
-| **7 · Bulk Export** | One `.xlsx` and one `.pptx` per category, in a folder per category, plus a run-level index + QC workbook. |
+| **7 · Bulk Export** | One `.xlsx` and one `.pptx` per category, in a folder per category, plus a run-level file index. |
 
 The intended order is **market mapping → identify the Total Market → category
 mapping → before/after → insights**, so the impact is always computed against a
@@ -290,7 +290,11 @@ metrics at all.
 
 | | BEFORE (MAT YA, MAT TY, Growth) | AFTER (MAT YA, MAT TY, Growth) | Level Shift (Δpp, share before, share after) | Contribution (share before/after, share of change) |
 
-**Brand value share** — MAT YA, MAT TY and share change in pp, before and after.
+For **Numeric Distribution** the contribution columns are not shown. A
+distribution level is not an accumulating quantity, so a share of the category's
+change is not a meaningful reading of it; the levels, the absolute change and the
+plain share remain, and the values are printed exactly as they arrive (a
+distribution is a percentage out of 100 and never exceeds 100).
 
 **Manufacturer / Brand Top-N** — the same shape as the market block, so the two
 read alike:
@@ -312,8 +316,18 @@ entities in the **previous** database, followed into the updated one. Movement:
 ranked #27 is still reported alongside the Top-10.
 
 **Contributors** — the largest absolute gainers and losers driving the change.
+Gain and Loss are the two halves of one comparison: both are drawn from entities
+whose change could be measured, both are bounded by zero, and both carry the same
+two figures (absolute change and contribution to the change). An entity present in
+only one dataset has no *change* — it is reported in the Top-N movement as
+`NEW` / `EXITED` instead. A half with no entities says so in words rather than
+printing an empty table.
 
-**QC** — the validation results for that category.
+A side with no row is treated as **zero**, not as unknown, for an additive metric:
+that is the convention the category total already uses, so an entity new in the
+updated dataset is a real rise and one that exited is a real fall, and the
+contributions reconcile with the change the headline reports. A rate metric has no
+zero level, so there a missing side stays unknown.
 
 ### Definitions
 
@@ -323,6 +337,21 @@ Level shift   = after growth - before growth        (percentage points)
 Share         = entity MAT TY / category MAT TY
 Contribution  = share of the category total, plus share of the total change
 ```
+
+---
+
+## Display units (step 5)
+
+Sales Value and Volume can be written in a unit of your choosing — **Auto** (from
+the data), Ones, Thousands, Millions or Billions — with 0–4 decimal places. The
+choice is resolved **once per metric for the whole run**, from the largest figure
+the run carries, and is carried into the report, so the screen, every Excel
+workbook and every PowerPoint deck in the run write the same figure the same way.
+Scaling each view from its own slice is how one number ends up in millions on
+screen and billions in a deck.
+
+A distribution level is a percentage and is never scaled, so Numeric Distribution
+has no unit setting.
 
 ---
 
@@ -360,12 +389,17 @@ Twelve checks run before the export. Three rules are enforced:
 - **A check that cannot fail is not a check.** A run also records **notes** —
   what it did to the data (how much of it is inside the mapped categories, a
   period column corrected, a period the workbook cannot supply). They appear in
-  the QC panel under **Run notes** and in every workbook's QC sheet, and they
-  are deliberately **not counted** among the checks: a run that verified
-  everything should not report "2 warnings" merely because it also told you what
-  it covered. They are also not shown above the headline figures — a titled
-  warning box over the KPIs reads as "this analysis is suspect" even when every
-  check passed.
+  the QC panel under **Run notes** and in the run index, and they are
+  deliberately **not counted** among the checks: a run that verified everything
+  should not report "2 warnings" merely because it also told you what it covered.
+  They are also not shown above the headline figures — a titled warning box over
+  the KPIs reads as "this analysis is suspect" even when every check passed.
+
+QC is shown in the app's step 6 and is **not written into the deliverables**: the
+QC sheet was removed from the Excel export and the QC slide from the deck on
+request. The checks still run — they gate the run and are what the panel reports —
+they are simply not shipped to the client. The run's scope notes survive in the
+run index, because a report covering a subset of the rows has to say so itself.
 
 | Check | What it proves |
 |---|---|
@@ -417,15 +451,71 @@ impact_studio/
 │   ├── analysis.py            before/after, level shift, contribution, Top-N
 │   ├── qc.py                  the eleven checks
 │   ├── export_excel.py        per-category workbook (xlsxwriter)
-│   ├── export_pptx.py         per-category deck (python-pptx, native charts)
+│   ├── export_pptx.py         per-category deck (python-pptx)
 │   └── main.py                FastAPI service
 ├── frontend/                  vanilla-JS single-page app (no build step)
+├── templates/
+│   └── impact_template.pptx   ← put your standard deck here (see templates/README.md)
 ├── tools/
 │   ├── verify_e2e.py          pipeline + mapping + category mapping + QC mutation tests
 │   ├── verify_api.py          live-server API integration test
 │   └── ui_probe/              headless-Chrome UI driver
 └── outputs/                   generated deliverables
 ```
+
+---
+
+## What the exports contain
+
+### Excel — `<Category>_Impact.xlsx`
+
+One flat table per sheet: a single header row, one record per row, no merged
+cells, so the tables can be filtered and pivoted.
+
+| sheet | content |
+| --- | --- |
+| `Channel (Sales Value)` | the market rows, **one table per level** — channels, then regions — in one sheet |
+| `Manufacturer Top-N (Sales Value)` | the Top-N manufacturers |
+| `Brand Top-N (Sales Value)` | the Top-N brands |
+| `Contributors (Sales Value)` | the gainers and losers |
+| … | one set per selected metric — Value, Volume, ND |
+| `Client Brands` | the client entities tracked, on the headline metric |
+
+Sheet names carry the metric because a run can measure several: a single Top-N
+table would silently answer only the first one.
+
+The market sheet carries the same level split the analysis shows. The Total Market
+leads each table and is **not** repeated as a "sum of rows above" beneath itself;
+that row appears only in a table that has no total at all, where the sum is the
+only aggregate there is.
+
+There is **no summary sheet and no QC sheet**. The figures a summary carried are
+in the tables beneath it, and the validation belongs to the app, not to the
+workbook the client receives.
+
+### PowerPoint — `<Category>_Impact.pptx`
+
+Built on **your own template** — drop it at `templates/impact_template.pptx`
+(see `templates/README.md`). Its master, theme, fonts and background graphics are
+used; its own slides are removed, and every layout placeholder is stripped from
+each generated slide, so no stale cover and no empty "Click to add text" box
+reaches the client. With no template present the export still runs, on a plain
+16:9 deck.
+
+Per category and **per metric**: an impact headline, a market table for the
+channels and another for the regions, Top-N manufacturers, Top-N brands, and
+"what drove the change". Then the client entities once. Every table has black
+borders, a compact layout, and negative figures in red.
+
+There is **no cover slide, no chart and no QC slide** — all three were removed on
+request. Add charts by hand where you want them.
+
+### Run index — `00_Index.xlsx`
+
+A list of every file the run produced, plus the run's scope notes. No category
+summary and no QC.
+
+---
 
 **Per-side wiring.** Every dimension and metric column is configured separately
 for dataset A and dataset B, falling back to A's name when B is unset. The two
